@@ -95,7 +95,7 @@ class OSMRelationBuilder:
 
         made_routes = {variant.tags["ref"] for variant in self.relations}
         unique_routes = gtfs_data["routes"].filter(
-            pl.col("route_id").is_in(made_routes)
+            pl.col("route_id").cast(pl.Utf8).is_in(made_routes)
         )
 
         for unique_route in unique_routes.iter_rows(named=True):
@@ -103,7 +103,7 @@ class OSMRelationBuilder:
                 "type": "route_master",
                 "route_master": "bus",
                 "ref": unique_route["route_id"],
-                "name": f"Route {unique_route['route_id']} {unique_route['route_long_name']}".strip(),
+                "name": f"Route {unique_route['route_short_name']} {unique_route['route_long_name']}".strip(),
             }
             if "route_color" in unique_route:
                 route_master_tags["route_color"] = "#" + unique_route["route_color"]
@@ -116,7 +116,7 @@ class OSMRelationBuilder:
                 tags=route_master_tags,
             )
             for route in self.relations:
-                if route.tags.get("ref") == unique_route["route_id"]:
+                if route.tags.get("ref") == unique_route["route_short_name"]:
                     master.add_member(osm_type="relation", ref=route.id)
             self.relations.append(master)
         logger.info(
@@ -159,7 +159,7 @@ class OSMRelationBuilder:
         # Process routes using vectorized operations
         route_trip_stops = (
             trips.join(stop_times, on="trip_id")
-            .filter(pl.col("route_id").is_in(routes_to_process["route_id"]))
+            .filter(pl.col("route_id").is_in(routes_to_process["route_id"].to_list()))
             .sort(["route_id", "trip_id", "stop_sequence"])
             .group_by(["route_id", "trip_id", "shape_id"], maintain_order=True)
             .agg([pl.col("stop_id").alias("stops")])

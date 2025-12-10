@@ -358,6 +358,7 @@ class TestGetStopLocations:
 class TestBuildRelations:
     """Tests for the build_relations method."""
 
+    @pytest.mark.slow
     def test_build_relations_basic(self, loaded_gtfs_data):
         """Test building relations from GTFS data."""
         builder = OSMRelationBuilder()
@@ -366,6 +367,7 @@ class TestBuildRelations:
         # Should have created some relations
         assert len(builder.relations) > 0
 
+    @pytest.mark.slow
     def test_build_relations_with_exclude_stops(self, loaded_gtfs_data):
         """Test building relations with stops excluded."""
         builder = OSMRelationBuilder(exclude_stops=True)
@@ -376,6 +378,7 @@ class TestBuildRelations:
             stop_members = [m for m in relation.members if m.role == "platform"]
             assert len(stop_members) == 0
 
+    @pytest.mark.slow
     def test_build_relations_with_exclude_routes(self, loaded_gtfs_data):
         """Test building relations with routes excluded."""
         builder = OSMRelationBuilder(exclude_routes=True)
@@ -386,6 +389,7 @@ class TestBuildRelations:
             way_members = [m for m in relation.members if m.type == "way"]
             assert len(way_members) == 0
 
+    @pytest.mark.slow
     def test_build_relations_filters_by_route_type(self, loaded_gtfs_data):
         """Test building relations filtered by route type."""
         # Filter for only subway (type 1)
@@ -396,6 +400,7 @@ class TestBuildRelations:
         for relation in builder.relations:
             assert relation.tags.get("route") == "subway"
 
+    @pytest.mark.slow
     def test_build_relations_filters_by_pattern(self, loaded_gtfs_data):
         """Test building relations filtered by route pattern."""
         builder = OSMRelationBuilder(route_ref_pattern="R1")
@@ -406,6 +411,7 @@ class TestBuildRelations:
         # So we should have at least some relations
         assert len(builder.relations) > 0
 
+    @pytest.mark.slow
     def test_build_relations_adds_custom_tags(self, loaded_gtfs_data):
         """Test building relations with custom tags."""
         custom_tags = {"network": "Test Network", "operator": "Test Operator"}
@@ -417,6 +423,7 @@ class TestBuildRelations:
             assert relation.tags.get("network") == "Test Network"
             assert relation.tags.get("operator") == "Test Operator"
 
+    @pytest.mark.slow
     def test_build_relations_with_route_direction(self, loaded_gtfs_data):
         """Test building relations with route direction enabled."""
         builder = OSMRelationBuilder(route_direction=True)
@@ -428,6 +435,7 @@ class TestBuildRelations:
             # Direction should be added (N, S, E, W, NE, etc.)
             assert len(name) > 0
 
+    @pytest.mark.slow
     def test_build_relations_has_required_tags(self, loaded_gtfs_data):
         """Test that built relations have required OSM tags."""
         builder = OSMRelationBuilder()
@@ -441,6 +449,7 @@ class TestBuildRelations:
             assert "ref" in relation.tags
             assert "name" in relation.tags
 
+    @pytest.mark.slow
     def test_build_relations_color_tag(self, loaded_gtfs_data):
         """Test that route color is included in tags."""
         builder = OSMRelationBuilder()
@@ -460,6 +469,7 @@ class TestBuildRelations:
 class TestBuildRouteMasters:
     """Tests for the build_route_masters method."""
 
+    @pytest.mark.slow
     def test_build_route_masters_creates_masters(self, loaded_gtfs_data):
         """Test that route_master relations are created."""
         builder = OSMRelationBuilder()
@@ -472,6 +482,7 @@ class TestBuildRouteMasters:
         # Should have added route_master relations (or at least same count if no masters needed)
         assert len(builder.relations) >= initial_relation_count
 
+    @pytest.mark.slow
     def test_build_route_masters_has_correct_type(self, loaded_gtfs_data):
         """Test that route_master relations have correct type."""
         builder = OSMRelationBuilder()
@@ -508,6 +519,7 @@ class TestWriteToFile:
 
         assert output_file.exists()
 
+    @pytest.mark.slow
     def test_write_to_file_valid_xml(self, tmp_path, loaded_gtfs_data):
         """Test that write_to_file creates valid XML."""
         builder = OSMRelationBuilder()
@@ -524,6 +536,7 @@ class TestWriteToFile:
         assert root.get("version") == "0.6"
         assert root.get("generator") == "gtfstoosm"
 
+    @pytest.mark.slow
     def test_write_to_file_contains_relations(self, tmp_path, loaded_gtfs_data):
         """Test that written file contains relations."""
         builder = OSMRelationBuilder()
@@ -579,6 +592,7 @@ class TestWriteToFile:
 class TestConvertGTFSToOSM:
     """Tests for the convert_gtfs_to_osm function."""
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_success(self, minimal_gtfs_zip, tmp_path):
         """Test successful GTFS to OSM conversion."""
         output_file = tmp_path / "output.osm"
@@ -589,6 +603,7 @@ class TestConvertGTFSToOSM:
         assert output_file.exists()
         assert output_file.stat().st_size > 0
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_creates_valid_xml(self, minimal_gtfs_zip, tmp_path):
         """Test that conversion creates valid XML output."""
         output_file = tmp_path / "output.osm"
@@ -602,6 +617,7 @@ class TestConvertGTFSToOSM:
         assert root.tag == "osmChange"
         assert root.get("version") == "0.6"
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_with_exclude_stops(self, minimal_gtfs_zip, tmp_path):
         """Test conversion with exclude_stops option."""
         output_file = tmp_path / "output.osm"
@@ -612,6 +628,7 @@ class TestConvertGTFSToOSM:
 
         assert result is True
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_with_exclude_routes(self, minimal_gtfs_zip, tmp_path):
         """Test conversion with exclude_routes option."""
         output_file = tmp_path / "output.osm"
@@ -622,6 +639,7 @@ class TestConvertGTFSToOSM:
 
         assert result is True
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_with_add_missing_stops(
         self, minimal_gtfs_zip, tmp_path
     ):
@@ -634,16 +652,18 @@ class TestConvertGTFSToOSM:
 
         assert result is True
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_with_search_radius(self, minimal_gtfs_zip, tmp_path):
         """Test conversion with custom stop_search_radius."""
         output_file = tmp_path / "output.osm"
 
         result = convert_gtfs_to_osm(
-            str(minimal_gtfs_zip), str(output_file), stop_search_radius=20.0
+            str(minimal_gtfs_zip), str(output_file), stop_search_radius=5.0
         )
 
         assert result is True
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_with_route_direction(self, minimal_gtfs_zip, tmp_path):
         """Test conversion with route_direction option."""
         output_file = tmp_path / "output.osm"
@@ -654,6 +674,7 @@ class TestConvertGTFSToOSM:
 
         assert result is True
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_with_route_ref_pattern(
         self, minimal_gtfs_zip, tmp_path
     ):
@@ -666,6 +687,7 @@ class TestConvertGTFSToOSM:
 
         assert result is True
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_with_relation_tags(self, minimal_gtfs_zip, tmp_path):
         """Test conversion with custom relation_tags."""
         output_file = tmp_path / "output.osm"
@@ -702,6 +724,7 @@ class TestConvertGTFSToOSM:
         with pytest.raises(Exception):
             convert_gtfs_to_osm(str(invalid_zip), str(output_file))
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_invalid_output_path(self, minimal_gtfs_zip):
         """Test conversion with invalid output path."""
         invalid_output = "/nonexistent/directory/output.osm"
@@ -709,6 +732,7 @@ class TestConvertGTFSToOSM:
         with pytest.raises(Exception):
             convert_gtfs_to_osm(str(minimal_gtfs_zip), invalid_output)
 
+    @pytest.mark.slow
     def test_convert_gtfs_to_osm_all_options(self, minimal_gtfs_zip, tmp_path):
         """Test conversion with all options enabled."""
         output_file = tmp_path / "output.osm"
@@ -732,6 +756,7 @@ class TestConvertGTFSToOSM:
 class TestIntegrationWithSampleFeed:
     """Integration tests with sample GTFS feed."""
 
+    @pytest.mark.slow
     def test_end_to_end_conversion_with_sample(self, sample_gtfs_zip, tmp_path):
         """Test complete conversion with sample GTFS feed."""
         output_file = tmp_path / "sample_output.osm"
@@ -762,6 +787,7 @@ class TestIntegrationWithSampleFeed:
             # Sample file may have data quality issues, that's ok for this test
             pytest.skip(f"Sample feed test skipped due to: {e}")
 
+    @pytest.mark.slow
     def test_sample_feed_relations_have_valid_structure(
         self, sample_gtfs_zip, tmp_path
     ):
@@ -791,6 +817,7 @@ class TestIntegrationWithSampleFeed:
         except Exception as e:
             pytest.skip(f"Sample feed test skipped due to: {e}")
 
+    @pytest.mark.slow
     def test_sample_feed_with_custom_options(self, sample_gtfs_zip, tmp_path):
         """Test sample feed conversion with custom options."""
         output_file = tmp_path / "sample_output.osm"
@@ -890,6 +917,7 @@ class TestEdgeCases:
         # Should default to bus
         assert result == "bus"
 
+    @pytest.mark.slow
     def test_build_relations_with_missing_shape_id(self, tmp_path):
         """Test building relations when shape_id is missing."""
         # Create GTFS without shape_id in trips
@@ -925,6 +953,7 @@ class TestEdgeCases:
             # If it fails due to missing shape, that's expected behavior
             assert True
 
+    @pytest.mark.slow
     def test_write_to_file_overwrites_existing(self, tmp_path, loaded_gtfs_data):
         """Test that write_to_file overwrites existing file."""
         builder = OSMRelationBuilder()

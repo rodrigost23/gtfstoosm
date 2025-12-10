@@ -30,7 +30,7 @@ python -m gtfstoosm.cli --input /path/to/gtfs.zip --output output.osc
 
 #### Route Filtering
 
-- `--route-ref-pattern`: Regex pattern to filter routes by their `route_id`. This allows you to process only specific routes that match the pattern
+- `--route-ref-pattern`: Regex pattern to filter routes by their `route_id`. This allows you to process only specific routes that match the pattern. Note that most GTFS feeds use the route reference code as the `route_id`, but some use a random integer.
   - Example: `"^[0-9]+$"` - Only numeric route IDs
   - Example: `"^C"` - Only routes starting with 'C'
   - Example: `"^(10|20|30)$"` - Only routes 10, 20, or 30
