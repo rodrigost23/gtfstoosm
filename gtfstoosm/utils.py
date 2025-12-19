@@ -1,4 +1,4 @@
-import math
+import random
 import re
 
 import atlus
@@ -6,10 +6,10 @@ from pydantic import BaseModel
 
 
 class Trip(BaseModel):
-    trip_id: int
+    trip_id: str | int
     route_id: str | int
     shape_id: str | int
-    stops: list[int]
+    stops: list[str | int]
 
 
 def string_to_unique_int(text: str, max_int: int = 2**31 - 1) -> int:
@@ -20,6 +20,8 @@ def string_to_unique_int(text: str, max_int: int = 2**31 - 1) -> int:
         text: The input string
         max_int: Maximum integer value (default is max 32-bit signed integer)
     """
+    if not text:
+        text = str(random.randint(0, max_int))
     # Create a positive integer hash
     hash_value = hash(text) & 0x7FFFFFFF  # Mask to ensure positive value
     return hash_value % max_int  # Ensure it's within range
@@ -35,8 +37,8 @@ def deduplicate_trips(trips: list[Trip]) -> list[Trip]:
     Returns:
         List of unique Trip objects (first occurrence kept for each unique stops sequence)
     """
-    seen_stops = set()
-    unique_trips = []
+    seen_stops: set[tuple[str | int, ...]] = set()
+    unique_trips: list[Trip] = []
 
     for trip in trips:
         # Convert stops list to tuple for hashing
@@ -71,14 +73,16 @@ def calculate_direction(
     lat_diff = end_latitude - start_latitude
     lon_diff = end_longitude - start_longitude
 
-    # Calculate direction
-    if lat_diff > lon_diff:
-        if start_latitude < end_latitude:
+    # Compare absolute differences to determine primary direction
+    if abs(lat_diff) > abs(lon_diff):
+        # Movement is primarily north-south
+        if lat_diff > 0:
             return "Northbound"
         else:
-            return "Soutbound"
+            return "Southbound"
     else:
-        if start_longitude < end_longitude:
+        # Movement is primarily east-west
+        if lon_diff > 0:
             return "Eastbound"
         else:
             return "Westbound"
@@ -101,7 +105,7 @@ def format_name(name: str) -> str:
     # Split the text while capturing the separators
     parts = split_compile.split(name)
 
-    processed_parts = []
+    processed_parts: list[str] = []
 
     for i, part in enumerate(parts):
         # If this is a separator (which will be at odd indices after the split)
@@ -124,50 +128,6 @@ def format_name(name: str) -> str:
     )
 
 
-def create_bounding_box(
-    latitude: float, longitude: float, distance_meters: float
-) -> list[str]:
-    """
-    Create a bounding box around a coordinate point.
-
-    Given a center coordinate and a distance in meters, this function returns
-    a bounding box where each side extends 'distance_meters' from the center,
-    creating a box with total side length of 2 * distance_meters.
-
-    Args:
-        latitude (float): The latitude of the center point in decimal degrees
-        longitude (float): The longitude of the center point in decimal degrees
-        distance_meters (float): The distance in meters from center to edge
-
-    Returns:
-        list[str]: A tuple containing (min_lat, min_lon, max_lat, max_lon)
-        representing the southwest and northeast corners of the bounding box
-
-    Note:
-        This function uses a simplified calculation that works well for small distances
-        but may become less accurate for very large distances or near the poles.
-    """
-    # Earth's radius in meters
-    EARTH_RADIUS = 6371000.0
-
-    # Convert distance to angular distance in radians
-    # For latitude: 1 degree ≈ 111,111 meters
-    lat_offset = math.degrees(distance_meters / EARTH_RADIUS)
-
-    # For longitude: varies by latitude due to Earth's curvature
-    # At a given latitude, longitude distance = cos(lat) * earth_circumference / 360
-    lat_radians = math.radians(latitude)
-    lon_offset = math.degrees(distance_meters / (EARTH_RADIUS * math.cos(lat_radians)))
-
-    # Calculate bounding box coordinates
-    min_latitude = latitude - lat_offset
-    max_latitude = latitude + lat_offset
-    min_longitude = longitude - lon_offset
-    max_longitude = longitude + lon_offset
-
-    return [str(i) for i in [min_latitude, min_longitude, max_latitude, max_longitude]]
-
-
 def parse_tag_string(tag_string: str) -> dict[str, str]:
     """
     Parse a semicolon-separated key=value string into a dictionary.
@@ -178,7 +138,7 @@ def parse_tag_string(tag_string: str) -> dict[str, str]:
     Returns:
         Dictionary of key-value pairs
     """
-    result = {}
+    result: dict[str, str] = {}
     for pair in tag_string.split(";"):
         pair = pair.strip()
         if "=" not in pair:

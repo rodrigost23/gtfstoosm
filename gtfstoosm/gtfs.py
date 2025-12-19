@@ -6,18 +6,28 @@ It handles the reading and validation of GTFS feeds.
 """
 
 import logging
-import re
 import zipfile
 from io import BytesIO
 
 import polars as pl
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
 
+class GTFSValidationError(Exception):
+    """Exception raised when GTFS feed validation fails."""
+
+    pass
+
+
 class GTFSFeed(BaseModel):
     """Class for storing and querying a GTFS feed."""
+
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,  # Allow Polars DataFrames
+        validate_assignment=True,
+    )
 
     feed_dir: str
     tables: dict[str, pl.DataFrame] = Field(default_factory=dict)
@@ -29,273 +39,322 @@ class GTFSFeed(BaseModel):
             "routes.txt",
             "trips.txt",
             "stop_times.txt",
-            "shapes.txt",
         ]
     )
     optional_files: list[str] = Field(
         default_factory=lambda: [
+            "shapes.txt",
             "calendar.txt",
             "calendar_dates.txt",
-            "fare_attributes.txt",
-            "fare_rules.txt",
-            "frequencies.txt",
-            "transfers.txt",
-            "pathways.txt",
-            "levels.txt",
-            "feed_info.txt",
-            "translations.txt",
-            "attributions.txt",
-            "timepoint_times.txt",
-            "timepoints.txt",
         ]
     )
 
-    class Config:
-        arbitrary_types_allowed = True  # Allow Polars DataFrames
-        validate_assignment = True
+    # Define required columns for each file (only for files needed for OSM conversion)
+    required_columns: dict[str, list[str]] = Field(
+        default_factory=lambda: {
+            "agency": ["agency_name", "agency_url", "agency_timezone"],
+            "stops": ["stop_id", "stop_name", "stop_lat", "stop_lon"],
+            "routes": [
+                "route_id",
+                "route_type",
+            ],  # route_short_name OR route_long_name needed but not both
+            "trips": ["route_id", "service_id", "trip_id"],
+            "stop_times": [
+                "trip_id",
+                "arrival_time",
+                "departure_time",
+                "stop_id",
+                "stop_sequence",
+            ],
+            "shapes": [
+                "shape_id",
+                "shape_pt_lat",
+                "shape_pt_lon",
+                "shape_pt_sequence",
+            ],
+        }
+    )
 
-    def load(self) -> None:
+    def validate_feed(self, strict: bool = False) -> list[str]:
         """
-        Load a GTFS feed.
-        """
-
-        # Read all files in the feed directory
-        with zipfile.ZipFile(self.feed_dir, "r") as zip_ref:
-            for file in zip_ref.namelist():
-                if file not in self.required_files:
-                    logger.debug(f"Skipping optional file {file}")
-                    continue
-                table_name = file[:-4]  # Remove the .txt extension
-                try:
-                    logger.debug(f"Loading {file}")
-                    with zip_ref.open(file) as file_obj:
-                        # Read the CSV data into a polars DataFrame
-                        df = pl.read_csv(
-                            BytesIO(file_obj.read()), infer_schema_length=None
-                        )
-
-                        logger.info(f"Loaded {df.height:,} records from {file}")
-                        self.tables[table_name] = df
-
-                except zipfile.BadZipFile:
-                    raise ValueError(
-                        f"The file at {self.feed_dir} is not a valid zip file"
-                    )
-                except Exception as e:
-                    raise ValueError(f"Error loading {file}: {str(e)}")
-
-    def _read_csv_file(self, file_path: str) -> pl.DataFrame:
-        """
-        Read a CSV file using Polars.
+        Validate the GTFS feed structure and contents.
 
         Args:
-            file_path: Path to the CSV file.
+            strict: If True, raises GTFSValidationError on any validation failure.
+                   If False, returns a list of validation warnings/errors.
 
         Returns:
-            pl.DataFrame: Polars DataFrame containing the data from the CSV file.
-        """
-        try:
-            # Read the CSV file using Polars
-            df = pl.read_csv(
-                file_path, infer_schema_length=None, null_values=[""], encoding="utf8"
-            )
+            List of validation messages (warnings and errors)
 
-            # Clean values in the DataFrame
-            for col in df.columns:
-                df = df.with_columns(
-                    pl.col(col)
-                    .map_elements(self._clean_value, return_dtype=pl.Utf8)
-                    .alias(col)
+        Raises:
+            GTFSValidationError: If strict=True and validation fails
+            FileNotFoundError: If the feed file doesn't exist
+            zipfile.BadZipFile: If the feed file is not a valid zip
+        """
+        issues: list[str] = []
+
+        try:
+            # Check if feed file exists and is a valid zip
+            with zipfile.ZipFile(self.feed_dir, "r") as zip_ref:
+                available_files = set(zip_ref.namelist())
+
+                # Validate required files are present
+                missing_files: list[str] = []
+                for required_file in self.required_files:
+                    if required_file not in available_files:
+                        missing_files.append(required_file)
+
+                if missing_files:
+                    error_msg = (
+                        f"Missing required GTFS files: {', '.join(missing_files)}"
+                    )
+                    issues.append(f"ERROR: {error_msg}")
+                    if strict:
+                        raise GTFSValidationError(error_msg)
+
+                # Validate file structure (columns) for available files
+                for file in available_files:
+                    if not file.endswith(".txt"):
+                        continue
+
+                    table_name = file[:-4]  # Remove .txt extension
+
+                    # Skip files we don't have column requirements for
+                    if table_name not in self.required_columns:
+                        continue
+
+                    try:
+                        with zip_ref.open(file) as file_obj:
+                            # Read just the header to check columns
+                            df = pl.read_csv(
+                                BytesIO(file_obj.read()),
+                                infer_schema_length=None,
+                                n_rows=1,
+                            )
+
+                            # Check for required columns
+                            available_columns = set(df.columns)
+                            required_cols = set(self.required_columns[table_name])
+                            missing_columns = required_cols - available_columns
+
+                            if missing_columns:
+                                error_msg = f"{file}: Missing required columns: {', '.join(sorted(missing_columns))}"
+                                issues.append(f"ERROR: {error_msg}")
+                                if strict:
+                                    raise GTFSValidationError(error_msg)
+
+                            # Special check for routes: need at least one name field
+                            if table_name == "routes":
+                                if (
+                                    "route_short_name" not in available_columns
+                                    and "route_long_name" not in available_columns
+                                ):
+                                    error_msg = f"{file}: Must have either route_short_name or route_long_name"
+                                    issues.append(f"ERROR: {error_msg}")
+                                    if strict:
+                                        raise GTFSValidationError(error_msg)
+
+                    except Exception as e:
+                        error_msg = f"{file}: Failed to read file - {str(e)}"
+                        issues.append(f"ERROR: {error_msg}")
+                        if strict:
+                            raise GTFSValidationError(error_msg) from e
+
+                # Add success message if no errors found (warnings are ok)
+                has_errors = any(issue.startswith("ERROR:") for issue in issues)
+                if not has_errors:
+                    issues.append("INFO: Basic GTFS structure validation passed")
+
+        except FileNotFoundError as e:
+            error_msg = f"GTFS feed file not found: {self.feed_dir}"
+            issues.append(f"ERROR: {error_msg}")
+            if strict:
+                raise GTFSValidationError(error_msg) from e
+            raise
+
+        except zipfile.BadZipFile as e:
+            error_msg = f"Invalid zip file: {self.feed_dir}"
+            issues.append(f"ERROR: {error_msg}")
+            if strict:
+                raise GTFSValidationError(error_msg) from e
+            raise
+
+        return issues
+
+    def validate_referential_integrity(self) -> list[str]:
+        """
+        Validate referential integrity between GTFS tables.
+
+        This checks that foreign key relationships are valid:
+        - trips.route_id references routes.route_id
+        - stop_times.trip_id references trips.trip_id
+        - stop_times.stop_id references stops.stop_id
+        - etc.
+
+        Returns:
+            List of referential integrity issues found
+
+        Note:
+            This should be called after load() has been called.
+        """
+        issues: list[str] = []
+
+        if not self.tables:
+            issues.append(
+                "WARNING: No tables loaded. Call load() before validating referential integrity."
+            )
+            return issues
+
+        # Check trips.route_id references routes.route_id
+        if "trips" in self.tables and "routes" in self.tables:
+            route_ids = set(self.tables["routes"]["route_id"].to_list())
+            trip_route_ids = set(self.tables["trips"]["route_id"].to_list())
+            invalid_routes = trip_route_ids - route_ids
+
+            if invalid_routes:
+                issues.append(
+                    f"ERROR: trips.route_id contains {len(invalid_routes)} invalid references to routes.route_id"
                 )
 
-            return df
+        # Check stop_times.trip_id references trips.trip_id
+        if "stop_times" in self.tables and "trips" in self.tables:
+            trip_ids = set(self.tables["trips"]["trip_id"].to_list())
+            stop_time_trip_ids = set(self.tables["stop_times"]["trip_id"].to_list())
+            invalid_trips = stop_time_trip_ids - trip_ids
 
-        except Exception as e:
-            print(f"Error reading {file_path}: {e}")
-            return pl.DataFrame()
+            if invalid_trips:
+                issues.append(
+                    f"ERROR: stop_times.trip_id contains {len(invalid_trips)} invalid references to trips.trip_id"
+                )
 
-    def _clean_value(self, value: str) -> str:
+        # Check stop_times.stop_id references stops.stop_id
+        if "stop_times" in self.tables and "stops" in self.tables:
+            stop_ids = set(self.tables["stops"]["stop_id"].to_list())
+            stop_time_stop_ids = set(self.tables["stop_times"]["stop_id"].to_list())
+            invalid_stops = stop_time_stop_ids - stop_ids
+
+            if invalid_stops:
+                issues.append(
+                    f"ERROR: stop_times.stop_id contains {len(invalid_stops)} invalid references to stops.stop_id"
+                )
+
+        # Check shapes reference if trips use shape_id
+        if "trips" in self.tables and "shapes" in self.tables:
+            if "shape_id" in self.tables["trips"].columns:
+                shape_ids = set(self.tables["shapes"]["shape_id"].to_list())
+                # Filter out null/empty shape_ids
+                trip_shape_ids = set(
+                    self.tables["trips"]
+                    .filter(pl.col("shape_id").is_not_null())["shape_id"]
+                    .to_list()
+                )
+                invalid_shapes = trip_shape_ids - shape_ids
+
+                if invalid_shapes:
+                    issues.append(
+                        f"ERROR: trips.shape_id contains {len(invalid_shapes)} invalid references to shapes.shape_id"
+                    )
+
+        # Check data completeness
+        if "stop_times" in self.tables:
+            stop_times_count = self.tables["stop_times"].height
+            if stop_times_count == 0:
+                issues.append("ERROR: stop_times.txt is empty")
+
+        if "stops" in self.tables:
+            stops_count = self.tables["stops"].height
+            if stops_count == 0:
+                issues.append("ERROR: stops.txt is empty")
+
+        if "routes" in self.tables:
+            routes_count = self.tables["routes"].height
+            if routes_count == 0:
+                issues.append("ERROR: routes.txt is empty")
+
+        if not issues:
+            issues.append("INFO: Referential integrity validation passed")
+
+        return issues
+
+    def load(self, validate_feed: bool = True, strict: bool = False) -> None:
         """
-        Clean a value from a GTFS feed.
+        Load a GTFS feed.
 
         Args:
-            value: The value to clean.
+            validate_feed: If True, validates the feed structure before loading
+            strict: If True, raises exception on validation failures
 
-        Returns:
-            The cleaned value.
+        Raises:
+            GTFSValidationError: If validation fails and strict=True
+            FileNotFoundError: If the feed file doesn't exist
+            zipfile.BadZipFile: If the feed file is not a valid zip
         """
-        if value is None:
-            return ""
+        # Validate feed structure first
+        if validate_feed:
+            validation_issues = self.validate_feed(strict=strict)
 
-        # Convert to string
-        if not isinstance(value, str):
-            value = str(value)
+            # Log validation results
+            for issue in validation_issues:
+                if issue.startswith("ERROR:"):
+                    logger.error(issue)
+                elif issue.startswith("WARNING:"):
+                    logger.warning(issue)
+                else:
+                    logger.info(issue)
 
-        # Replace line breaks with spaces
-        value = value.replace("\n", " ").replace("\r", " ")
+            # Check if there were any errors
+            has_errors = any(issue.startswith("ERROR:") for issue in validation_issues)
+            if has_errors and strict:
+                raise GTFSValidationError(
+                    "Feed validation failed. See logs for details."
+                )
 
-        # Replace multiple spaces with a single space
-        value = re.sub(r"\s+", " ", value)
+        # Read all files in the feed directory
+        try:
+            with zipfile.ZipFile(self.feed_dir, "r") as zip_ref:
+                all_txt_files = [f for f in zip_ref.namelist() if f.endswith(".txt")]
 
-        # Strip leading and trailing whitespace
-        value = value.strip()
+                for file in all_txt_files:
+                    table_name = file[:-4]  # Remove the .txt extension
 
-        return value
+                    # Skip if not in required or optional files
+                    if (
+                        file not in self.required_files
+                        and file not in self.optional_files
+                    ):
+                        logger.debug(f"Skipping unknown file {file}")
+                        continue
 
-    def get_table(self, table_name) -> pl.DataFrame:
-        """
-        Get a table from the GTFS feed.
+                    try:
+                        logger.debug(f"Loading {file}")
+                        with zip_ref.open(file) as file_obj:
+                            # Read the CSV data into a polars DataFrame
+                            df = pl.read_csv(
+                                BytesIO(file_obj.read()), infer_schema_length=None
+                            )
 
-        Args:
-            table_name: The name of the table to get.
+                            logger.info(f"Loaded {df.height:,} records from {file}")
+                            self.tables[table_name] = df
 
-        Returns:
-            pl.DataFrame: Polars DataFrame containing the data from the table.
-        """
-        if table_name in self.tables:
-            return self.tables[table_name]
-        else:
-            return pl.DataFrame()
+                    except Exception as e:
+                        logger.error(f"Failed to load {file}: {str(e)}")
+                        if strict:
+                            raise
 
+                # Check if we loaded required files
+                loaded_required = [
+                    f for f in self.required_files if f[:-4] in self.tables
+                ]
+                if len(loaded_required) < len(self.required_files):
+                    missing = [
+                        f for f in self.required_files if f[:-4] not in self.tables
+                    ]
+                    error_msg = f"Failed to load required files: {', '.join(missing)}"
+                    logger.error(error_msg)
+                    if strict:
+                        raise GTFSValidationError(error_msg)
 
-class GTFSToOSMMapper:
-    """Class for mapping GTFS data to OSM data."""
-
-    @staticmethod
-    def map_route_type_to_osm(route_type):
-        """
-        Map a GTFS route type to OSM tags.
-
-        Args:
-            route_type: The GTFS route type.
-
-        Returns:
-            dict: Dictionary containing OSM tags.
-        """
-        # Convert route_type to integer if it's a string
-        if isinstance(route_type, str):
-            try:
-                route_type = int(route_type)
-            except ValueError:
-                return {"route": "unknown"}
-
-        # Map GTFS route types to OSM route types
-        # https://developers.google.com/transit/gtfs/reference#routestxt
-        gtfs_to_osm = {
-            0: {"route": "tram"},
-            1: {"route": "subway"},
-            2: {"route": "train"},
-            3: {"route": "bus"},
-            4: {"route": "ferry"},
-            5: {"route": "tram", "tram": "cable_car"},
-            6: {"route": "aerialway"},
-            7: {"route": "funicular"},
-            11: {"route": "trolleybus"},
-            12: {"route": "monorail"},
-        }
-
-        # Return OSM tags for the route type
-        return gtfs_to_osm.get(route_type, {"route": "unknown"})
-
-    @staticmethod
-    def map_stop_to_osm(stop, route_type=None):
-        """
-        Map a GTFS stop to OSM tags.
-
-        Args:
-            stop: The GTFS stop as a dictionary or DataFrame row.
-            route_type: The GTFS route type.
-
-        Returns:
-            dict: Dictionary containing OSM tags.
-        """
-        # Convert Polars row to dictionary if necessary
-        if hasattr(stop, "to_dict"):
-            stop = {col: stop[col] for col in stop.keys()}
-
-        # Start with basic tags
-        tags = {
-            "name": stop.get("stop_name", ""),
-            "ref": stop.get("stop_id", ""),
-            "public_transport": "stop_position",
-        }
-
-        # Add location type specific tags
-        location_type = stop.get("location_type", "0")
-        if location_type == "1":  # Station
-            tags["public_transport"] = "station"
-        elif location_type == "2":  # Entrance/Exit
-            tags["public_transport"] = "entrance"
-        elif location_type == "3":  # Generic Node
-            tags["public_transport"] = "node"
-        elif location_type == "4":  # Boarding Area
-            tags["public_transport"] = "platform"
-
-        # Add wheelchair accessibility
-        wheelchair_boarding = stop.get("wheelchair_boarding", "")
-        if wheelchair_boarding == "1":
-            tags["wheelchair"] = "yes"
-        elif wheelchair_boarding == "2":
-            tags["wheelchair"] = "no"
-
-        # Add route type specific tags
-        if route_type is not None:
-            route_tags = GTFSToOSMMapper.map_route_type_to_osm(route_type)
-            if route_tags.get("route") == "bus":
-                tags["highway"] = "bus_stop"
-            elif route_tags.get("route") == "tram":
-                tags["railway"] = "tram_stop"
-            elif (
-                route_tags.get("route") == "subway"
-                or route_tags.get("route") == "train"
-            ):
-                tags["railway"] = "station"
-            elif route_tags.get("route") == "ferry":
-                tags["amenity"] = "ferry_terminal"
-
-        return tags
-
-    @staticmethod
-    def map_route_to_osm(route, agency_name=None):
-        """
-        Map a GTFS route to OSM tags.
-
-        Args:
-            route: The GTFS route as a dictionary or DataFrame row.
-            agency_name: The name of the agency.
-
-        Returns:
-            dict: Dictionary containing OSM tags.
-        """
-        # Convert Polars row to dictionary if necessary
-        if hasattr(route, "to_dict"):
-            route = {col: route[col] for col in route.keys()}
-
-        # Start with basic tags
-        tags = {
-            "type": "route",
-            "ref": route.get("route_short_name", ""),
-            "name": route.get("route_long_name", ""),
-        }
-
-        # Add agency information
-        if agency_name:
-            tags["operator"] = agency_name
-
-        # Add route type specific tags
-        route_type = route.get("route_type", "")
-        route_tags = GTFSToOSMMapper.map_route_type_to_osm(route_type)
-        tags.update(route_tags)
-
-        # Add color information
-        if "route_color" in route and route["route_color"]:
-            tags["colour"] = "#" + route["route_color"]
-
-        # Add route URL if available
-        if "route_url" in route and route["route_url"]:
-            tags["website"] = route["route_url"]
-
-        # Clean up empty tags
-        tags = {k: v for k, v in tags.items() if v}
-
-        return tags
+        except zipfile.BadZipFile as err:
+            raise ValueError(
+                f"The file at {self.feed_dir} is not a valid zip file"
+            ) from err

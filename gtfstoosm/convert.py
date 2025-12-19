@@ -8,7 +8,6 @@ converting it to OSM relations that can be imported into OpenStreetMap.
 import logging
 import random
 import time
-from typing import Any
 
 import polars as pl
 import requests
@@ -44,18 +43,18 @@ class OSMRelationBuilder:
         """
         Initialize the OSM relation builder.
         """
-        self.exclude_stops = exclude_stops
-        self.exclude_routes = exclude_routes
-        self.add_missing_stops = add_missing_stops
-        self.route_types = route_types
-        self.agency_id = agency_id
+        self.exclude_stops: bool = exclude_stops
+        self.exclude_routes: bool = exclude_routes
+        self.add_missing_stops: bool = add_missing_stops
+        self.route_types: list[int] | None = route_types
+        self.agency_id: str | None = agency_id
         self.relations: list[OSMRelation] = []
         self.nodes: list[OSMNode] = []
         self.new_stops: list[OSMNode] = []
-        self.search_radius = search_radius
-        self.route_direction = route_direction
-        self.route_ref_pattern = route_ref_pattern
-        self.relation_tags = relation_tags
+        self.search_radius: float = search_radius
+        self.route_direction: bool = route_direction
+        self.route_ref_pattern: str | None = route_ref_pattern
+        self.relation_tags: dict[str, str] | None = relation_tags
 
     def __str__(self) -> str:
         # Exclude None values and internal collections
@@ -96,7 +95,7 @@ class OSMRelationBuilder:
 
         made_routes = {variant.tags["ref"] for variant in self.relations}
         unique_routes = gtfs_data["routes"].filter(
-            pl.col("route_id").is_in(made_routes)
+            pl.col("route_id").cast(pl.Utf8).is_in(made_routes)
         )
 
         for unique_route in unique_routes.iter_rows(named=True):
@@ -104,7 +103,7 @@ class OSMRelationBuilder:
                 "type": "route_master",
                 "route_master": "bus",
                 "ref": unique_route["route_id"],
-                "name": f"Route {unique_route['route_id']} {unique_route['route_long_name']}".strip(),
+                "name": f"Route {unique_route['route_short_name']} {unique_route['route_long_name']}".strip(),
             }
             if "route_color" in unique_route:
                 route_master_tags["route_color"] = "#" + unique_route["route_color"]
@@ -117,7 +116,7 @@ class OSMRelationBuilder:
                 tags=route_master_tags,
             )
             for route in self.relations:
-                if route.tags.get("ref") == unique_route["route_id"]:
+                if route.tags.get("ref") == unique_route["route_short_name"]:
                     master.add_member(osm_type="relation", ref=route.id)
             self.relations.append(master)
         logger.info(
@@ -160,7 +159,7 @@ class OSMRelationBuilder:
         # Process routes using vectorized operations
         route_trip_stops = (
             trips.join(stop_times, on="trip_id")
-            .filter(pl.col("route_id").is_in(routes_to_process["route_id"]))
+            .filter(pl.col("route_id").is_in(routes_to_process["route_id"].to_list()))
             .sort(["route_id", "trip_id", "stop_sequence"])
             .group_by(["route_id", "trip_id", "shape_id"], maintain_order=True)
             .agg([pl.col("stop_id").alias("stops")])
@@ -173,7 +172,7 @@ class OSMRelationBuilder:
 
             try:
                 route_info = routes_to_process.filter(
-                    pl.col("route_id") == route_ref
+                    pl.col("route_id").cast(pl.Utf8) == route_ref
                 ).row(0)
                 logger.info(f"Processing route {route_ref}")
             except pl.exceptions.OutOfBoundsError:
@@ -222,8 +221,8 @@ class OSMRelationBuilder:
                     "ref": route_info[2],
                     "name": f"Route {route_info[2]} {format_name(route_info[3])} {direction}".strip(),
                 }
-                if route_info[7]:
-                    route_tags["colour"] = "#" + route_info[7]
+                if route_info[7] and len(route_info[7].strip("#")) in (3, 6):
+                    route_tags["colour"] = "#" + route_info[7].strip("#")
 
                 if self.relation_tags:
                     route_tags.update(self.relation_tags)
@@ -263,7 +262,7 @@ class OSMRelationBuilder:
         if stops.is_empty():
             return []
 
-        osm_elements = []
+        osm_elements: list[OSMElement] = []
         # overpass_url = "https://overpass-api.de/api/interpreter"
         overpass_url = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
 
@@ -630,29 +629,7 @@ class OSMRelationBuilder:
 
         return route_type_map.get(route_type, "bus")
 
-    def _get_network_name(
-        self, route: dict[str, Any], agencies: list[dict[str, Any]]
-    ) -> str:
-        """
-        Get the network name for a route.
-
-        Args:
-            route: GTFS route dictionary
-            agencies: List of GTFS agency dictionaries
-
-        Returns:
-            Network name for OSM
-        """
-        agency_id = route.get("agency_id")
-        if agency_id and agencies:
-            for agency in agencies:
-                if agency.get("agency_id") == agency_id:
-                    return agency.get("agency_name", "")
-
-        # Default if no agency found
-        return ""
-
-    def is_stop_duplicate(self, new_stop):
+    def is_stop_duplicate(self, new_stop: OSMNode) -> bool:
         """Check if a stop is already in self.new_stops."""
         for existing_stop in self.new_stops:
             # Check if ID matches
@@ -695,10 +672,12 @@ class OSMRelationBuilder:
 
         except Exception as e:
             logger.error(f"Error writing OSM file: {str(e)}")
-            raise OSError(f"Failed to write OSM file: {str(e)}")
+            raise OSError(f"Failed to write OSM file: {str(e)}") from e
 
 
-def convert_gtfs_to_osm(gtfs_path: str, osm_path: str, **options: dict) -> bool:
+def convert_gtfs_to_osm(
+    gtfs_path: str, osm_path: str, **options: dict[str, bool | int | str]
+) -> bool:
     """
     Convert a GTFS feed to OSM relations.
 
