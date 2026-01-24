@@ -21,7 +21,7 @@ def fixtures_dir():
 @pytest.fixture
 def sample_gtfs_zip(fixtures_dir):
     """Return the path to the sample GTFS zip file."""
-    zip_path = fixtures_dir / "omniride.zip"
+    zip_path = fixtures_dir / "cvt.zip"
     if not zip_path.exists():
         pytest.skip(f"Sample GTFS zip file not found at {zip_path}")
     return str(zip_path)

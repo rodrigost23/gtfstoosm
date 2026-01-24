@@ -128,6 +128,7 @@ dmypy.json
 
 # GTFS specific
 *.zip
+!tests/fixtures/*.zip
 *.txt
 !requirements.txt
 
