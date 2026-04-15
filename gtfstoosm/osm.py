@@ -45,7 +45,7 @@ class OSMNode(OSMElement):
     uid: int = 1
 
     def to_xml(self) -> str:
-        osm_text = f'<node id="{self.id}" lat="{self.lat}" lon="{self.lon}">'
+        osm_text = f'<node id="{self.id}" version="{self.version}" lat="{self.lat}" lon="{self.lon}">'
         osm_text += self.tags_to_xml()
         osm_text += "</node>"
         return osm_text
@@ -67,7 +67,7 @@ class OSMWay(OSMElement):
         self.nodes.append(node_id)
 
     def to_xml(self) -> str:
-        osm_text = f'<way id="{self.id}" visible="{self.visible}">'
+        osm_text = f'<way id="{self.id}" version="{self.version}" visible="{self.visible}">'
         osm_text += "\n".join([f"<nd ref='{node_id}'></nd>" for node_id in self.nodes])
         osm_text += self.tags_to_xml()
         return osm_text + "</way>"
@@ -108,7 +108,7 @@ class OSMRelation(OSMElement):
 
     def to_xml(self) -> str:
         """Create an XML relation element."""
-        osm_text = f'<relation id="{self.id}" visible="{self.visible}">'
+        osm_text = f'<relation id="{self.id}" version="{self.version}" visible="{self.visible}">'
 
         osm_text += "\n".join([member.to_xml() for member in self.members])
         osm_text += self.tags_to_xml()

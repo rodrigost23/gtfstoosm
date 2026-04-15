@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 class OSMRelationBuilder:
     """Class for building OSM relations from GTFS data."""
 
+    # OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+    # OVERPASS_URL = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
+    # OVERPASS_URL = "https://overpass.kumi.systems/api/interpreter"
+    OVERPASS_URL = "https://overpass.private.coffee/api/interpreter"
+    USER_AGENT = "gtfstoosm/1.0 (https://github.com/whubsch/gtfstoosm)"
+
     def __init__(
         self,
         exclude_stops: bool = False,
@@ -93,20 +99,32 @@ class OSMRelationBuilder:
         """
         logger.info("Creating route_master relations")
 
+        # Get bbox for Overpass queries
+        bbox = self._get_bbox(gtfs_data["stops"])
+
         made_routes = {variant.tags["ref"] for variant in self.relations}
         unique_routes = gtfs_data["routes"].filter(
-            pl.col("route_id").cast(pl.Utf8).is_in(made_routes)
+            pl.col("route_short_name").cast(pl.Utf8).is_in(made_routes)
         )
 
         for unique_route in unique_routes.iter_rows(named=True):
+            route_ref = str(unique_route["route_short_name"])
+            gtfs_route_id = str(unique_route["route_id"])
+            master_name = f"Route {unique_route['route_short_name']} {unique_route['route_long_name']}".strip()
+
+            # Look for existing relations in OSM
+            existing = self._find_existing_routes(route_ref, master_name, bbox)
+
             route_master_tags = {
                 "type": "route_master",
                 "route_master": "bus",
-                "ref": unique_route["route_id"],
-                "name": f"Route {unique_route['route_short_name']} {unique_route['route_long_name']}".strip(),
+                "ref": route_ref,
+                "name": master_name,
             }
             if "route_color" in unique_route:
-                route_master_tags["route_color"] = "#" + unique_route["route_color"]
+                route_master_tags["route_color"] = "#" + str(
+                    unique_route["route_color"]
+                )
 
             if self.relation_tags:
                 route_master_tags.update(self.relation_tags)
@@ -115,14 +133,80 @@ class OSMRelationBuilder:
                 str(k): str(v) for k, v in route_master_tags.items() if v is not None
             }
 
+            # Reuse existing master ID if found
+            master_id = (
+                existing["master"]["id"]
+                if existing["master"]
+                else -1 * random.randint(1, 10**6)
+            )
+
             master = OSMRelation(
-                id=-1 * random.randint(1, 10**6),
+                id=master_id,
                 tags=route_master_tags,
             )
+
+            # Try to match GTFS sub-routes to existing OSM sub-routes
+            available_existing = list(existing["routes"])
             for route in self.relations:
-                if route.tags.get("ref") == unique_route["route_short_name"]:
+                if route.tags.get("ref") == route_ref:
+                    # If we have existing sub-routes, try to match by name or gtfs:route_id or gtfs:shape_id
+                    match = None
+                    if available_existing:
+                        match = next(
+                            (
+                                r
+                                for r in available_existing
+                                if r.get("tags", {}).get("gtfs:shape_id")
+                                == route.tags.get("gtfs:shape_id")
+                            ),
+                            None,
+                        )
+
+                        if not match:
+                            match = next(
+                                (
+                                    r
+                                    for r in available_existing
+                                    if r.get("tags", {}).get("name")
+                                    == route.tags.get("name")
+                                ),
+                                None,
+                            )
+                        
+                        if not match:
+                            match = next(
+                                (
+                                    r
+                                    for r in available_existing
+                                    if str(
+                                        r.get("tags", {}).get("gtfs:shape_id", "")
+                                    ).startswith(gtfs_route_id)
+                                ),
+                                None,
+                            )
+                        
+                        if not match:
+                            match = next(
+                                (
+                                    r
+                                    for r in available_existing
+                                    if r.get("tags", {}).get("gtfs:route_id")
+                                    == gtfs_route_id
+                                ),
+                                None,
+                            )
+
+                        if match:
+                            logger.info(
+                                f"Matching GTFS route '{route.tags.get('name')}' to existing OSM relation {match['id']}"
+                            )
+                            route.id = match["id"]
+                            available_existing.remove(match)
+
                     master.add_member(osm_type="relation", ref=route.id)
+
             self.relations.append(master)
+
         logger.info(
             f"Built {len([i for i in self.relations if i.tags.get('route_master')])} route_master relations"
         )
@@ -224,6 +308,7 @@ class OSMRelationBuilder:
                     "route": self._get_osm_route_type(route_info[5]),
                     "ref": route_info[2],
                     "name": f"Route {route_info[2]} {format_name(route_info[3])} {direction}".strip(),
+                    "gtfs:shape_id": str(trip_sequence.shape_id),
                 }
                 if route_info[7] and len(route_info[7].strip("#")) in (3, 6):
                     route_tags["colour"] = "#" + route_info[7].strip("#")
@@ -254,6 +339,57 @@ class OSMRelationBuilder:
 
                 self.relations.append(relation)
 
+    def _get_bbox(self, stops: pl.DataFrame) -> tuple[float, float, float, float]:
+        """Calculate the bounding box of all stops."""
+        return (
+            stops["stop_lat"].min(),
+            stops["stop_lon"].min(),
+            stops["stop_lat"].max(),
+            stops["stop_lon"].max(),
+        )
+
+    def _find_existing_routes(
+        self, ref: str, name: str, bbox: tuple[float, float, float, float]
+    ) -> dict:
+        """Query Overpass for existing route_master and its route members."""
+        s, w, n, e = bbox
+        query = f"""
+        [out:json][timeout:30];
+        (
+          rel["type"="route"]["route"="bus"]["ref"="{ref}"]({s},{w},{n},{e});
+        )->.routes;
+        
+        (
+          rel(br.routes)["type"="route_master"];
+        )->.master;
+
+        .master out tags;
+        .routes out tags;
+        """
+
+        try:
+            response = requests.post(
+                self.OVERPASS_URL, data=query, headers={"User-Agent": self.USER_AGENT}
+            )
+            if response.status_code == 200:
+                elements = response.json().get("elements", [])
+                master = next(
+                    (
+                        e
+                        for e in elements
+                        if e.get("tags", {}).get("type") == "route_master"
+                    ),
+                    None,
+                )
+                routes = [
+                    e for e in elements if e.get("tags", {}).get("type") == "route"
+                ]
+                return {"master": master, "routes": routes}
+        except Exception as e:
+            logger.warning(f"Error searching for existing routes: {e}")
+
+        return {"master": None, "routes": []}
+
     def _get_stop_objects(
         self, stops: pl.DataFrame, add_missing_stops: bool, max_distance: float = 5
     ) -> list[OSMElement]:
@@ -271,8 +407,6 @@ class OSMRelationBuilder:
             return []
 
         osm_elements: list[OSMElement] = []
-        # overpass_url = "https://overpass-api.de/api/interpreter"
-        overpass_url = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
 
         # Build a single query with all coordinates
         around_clauses = [
@@ -305,11 +439,9 @@ class OSMRelationBuilder:
                     f"Querying Overpass API for {stops.height} stop locations (attempt {retry_count + 1})"
                 )
                 response = requests.post(
-                    overpass_url,
+                    self.OVERPASS_URL,
                     data=query,
-                    headers={
-                        "User-Agent": "gtfstoosm (https://github.com/whubsch/gtfstoosm)"
-                    },
+                    headers={"User-Agent": self.USER_AGENT},
                 )
 
                 if response.status_code == 200:
@@ -671,21 +803,28 @@ class OSMRelationBuilder:
             with open(output_path, "w") as f:
                 f.write("<?xml version='1.0' encoding='UTF-8'?>\n")
                 f.write("<osmChange version='0.6' generator='gtfstoosm'>\n")
-                f.write("<create>\n")
 
-                # Write new stops
-                for stop in self.new_stops:
-                    f.write(stop.to_xml() + "\n")
+                # Separate elements for create and modify
+                to_create = (
+                    [s for s in self.new_stops]
+                    + [n for n in self.nodes]
+                    + [r for r in self.relations if r.id < 0]
+                )
+                to_modify = [r for r in self.relations if r.id > 0]
 
-                # Write nodes
-                for node in self.nodes:
-                    f.write(node.to_xml() + "\n")
+                if to_create:
+                    f.write("<create>\n")
+                    for element in to_create:
+                        f.write(element.to_xml() + "\n")
+                    f.write("</create>\n")
 
-                # Write relations
-                for relation in self.relations:
-                    f.write(relation.to_xml() + "\n")
+                if to_modify:
+                    f.write("<modify>\n")
+                    for element in to_modify:
+                        f.write(element.to_xml() + "\n")
+                    f.write("</modify>\n")
 
-                f.write("</create>\n</osmChange>\n")
+                f.write("</osmChange>\n")
 
             logger.info(f"Successfully wrote OSM data to {output_path}")
 
