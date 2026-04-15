@@ -111,20 +111,37 @@ class OSMRelationBuilder:
             route_ref = str(unique_route["route_short_name"])
             gtfs_route_id = str(unique_route["route_id"])
             master_name = f"Route {unique_route['route_short_name']} {unique_route['route_long_name']}".strip()
+            osm_route_type = self._get_osm_route_type(unique_route.get("route_type", 3))
 
             # Look for existing relations in OSM
             existing = self._find_existing_routes(route_ref, master_name, bbox)
 
             route_master_tags = {
                 "type": "route_master",
-                "route_master": "bus",
+                "route_master": osm_route_type,
                 "ref": route_ref,
                 "name": master_name,
+                "public_transport:version": "2",
+                "gtfs:route_id": gtfs_route_id,
             }
-            if "route_color" in unique_route:
-                route_master_tags["route_color"] = "#" + str(
+
+            if "agency" in gtfs_data and not gtfs_data["agency"].is_empty():
+                agency_id = unique_route.get("agency_id")
+                agency_row = None
+                if agency_id is not None:
+                    agency_matches = gtfs_data["agency"].filter(pl.col("agency_id") == agency_id)
+                    if not agency_matches.is_empty():
+                        agency_row = agency_matches.row(0, named=True)
+                if not agency_row:
+                    agency_row = gtfs_data["agency"].row(0, named=True)
+                if agency_row and "agency_name" in agency_row and agency_row["agency_name"]:
+                    route_master_tags["operator"] = str(agency_row["agency_name"])
+                    route_master_tags["network"] = str(agency_row["agency_name"])
+
+            if unique_route.get("route_color"):
+                route_master_tags["colour"] = "#" + str(
                     unique_route["route_color"]
-                )
+                ).strip("#")
 
             if self.relation_tags:
                 route_master_tags.update(self.relation_tags)
