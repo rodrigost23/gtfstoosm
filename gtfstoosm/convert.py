@@ -234,13 +234,14 @@ class OSMRelationBuilder:
 
         Args:
             gtfs_data: Complete GTFS data dictionary
-            include_stops: Whether to include stops in the output relations
         """
         routes = gtfs_data["routes"]
         trips = gtfs_data["trips"]
         stop_times = gtfs_data["stop_times"]
         stops = gtfs_data["stops"]
         shapes = gtfs_data["shapes"]
+        frequencies = gtfs_data.get("frequencies", None)
+        calendar = gtfs_data.get("calendar", None)
 
         logger.info(f"Processing {routes.height} routes")
 
@@ -278,7 +279,7 @@ class OSMRelationBuilder:
             try:
                 route_info = routes_to_process.filter(
                     pl.col("route_id").cast(pl.Utf8) == route_ref
-                ).row(0)
+                ).row(0, named=True)
                 logger.info(f"Processing route {route_ref}")
             except pl.exceptions.OutOfBoundsError:
                 continue
@@ -301,16 +302,20 @@ class OSMRelationBuilder:
             for trip_sequence in trip_sequences:
                 # Get the stop locations (with lat and long)
                 stop_locations = self._get_stop_locations(trip_sequence.stops, stops)
+                
+                # Fetch route ways and snapped stop positions using Valhalla
+                osm_way_ids = []
+                snapped_stops = []
+                if not self.exclude_routes:
+                    osm_way_ids, snapped_stops = self._get_route_ways_and_snaps(
+                        trip_sequence.shape_id, shapes, stop_locations
+                    )
+                
                 stop_objects = []
                 if not self.exclude_stops:
                     stop_objects = self._get_stop_objects(
                         stop_locations, self.add_missing_stops, self.search_radius
                     )
-
-                # Get the OSM ways that make up the route
-                osm_way_ids = []
-                if not self.exclude_routes:
-                    osm_way_ids = self._get_route_ways(trip_sequence.shape_id, shapes)
 
                 # Calculate direction
                 direction = ""
@@ -318,17 +323,55 @@ class OSMRelationBuilder:
                     first_stop = stop_locations.head(1).select(["lat", "lon"]).row(0)
                     last_stop = stop_locations.tail(1).select(["lat", "lon"]).row(0)
                     direction = calculate_direction(first_stop, last_stop)
+                
+                # Get From and To names
+                from_name = stop_locations.head(1).select(["name"]).row(0)[0] if not stop_locations.is_empty() else ""
+                to_name = stop_locations.tail(1).select(["name"]).row(0)[0] if not stop_locations.is_empty() else ""
 
                 route_tags = {
                     "type": "route",
                     "public_transport:version": "2",
-                    "route": self._get_osm_route_type(route_info[5]),
-                    "ref": route_info[2],
-                    "name": f"Route {route_info[2]} {format_name(route_info[3])} {direction}".strip(),
+                    "route": self._get_osm_route_type(route_info.get("route_type", 3)),
+                    "ref": route_info.get("route_short_name", ""),
+                    "from": format_name(from_name),
+                    "to": format_name(to_name),
+                    "name": f"Route {route_info.get('route_short_name', '')} {format_name(route_info.get('route_long_name', ''))} {direction}".strip(),
                     "gtfs:shape_id": str(trip_sequence.shape_id),
+                    "gtfs:route_id": str(route_info.get("route_id", "")),
                 }
-                if route_info[7] and len(route_info[7].strip("#")) in (3, 6):
-                    route_tags["colour"] = "#" + route_info[7].strip("#")
+                
+                # Add Duration
+                duration = self._calculate_duration(trip_sequence.trip_id, stop_times)
+                if duration:
+                    route_tags["duration"] = duration
+                    
+                # Add Schedule Tags
+                schedule_tags = self._calculate_schedule_tags(
+                    route_info.get("route_id", ""),
+                    trip_sequence.shape_id,
+                    trips,
+                    stop_times,
+                    calendar,
+                    frequencies
+                )
+                route_tags.update(schedule_tags)
+                
+                if "agency" in gtfs_data and not gtfs_data["agency"].is_empty():
+                    agency_id = route_info.get("agency_id")
+                    agency_row = None
+                    if agency_id is not None:
+                        agency_matches = gtfs_data["agency"].filter(pl.col("agency_id") == agency_id)
+                        if not agency_matches.is_empty():
+                            agency_row = agency_matches.row(0, named=True)
+                    if not agency_row:
+                        agency_row = gtfs_data["agency"].row(0, named=True)
+                    if agency_row and "agency_name" in agency_row and agency_row["agency_name"]:
+                        route_tags["operator"] = str(agency_row["agency_name"])
+                        route_tags["network"] = str(agency_row["agency_name"])
+
+                route_color = route_info.get("route_color")
+                if route_color and len(str(route_color).strip("#")) in (3, 6):
+                    route_tags["colour"] = "#" + str(route_color).strip("#")
 
                 if self.relation_tags:
                     route_tags.update(self.relation_tags)
@@ -344,10 +387,33 @@ class OSMRelationBuilder:
                     members=[],
                 )
 
-                # Add stop objects as members
-                for stop_object in stop_objects:
+                # Add stop positions and platforms as members
+                # Try to pair them up
+                for stop_obj, stop_loc in zip(stop_objects, stop_locations.iter_rows(named=True)):
+                    gtfs_stop_id = str(stop_loc["stop_id"])
+                    
+                    # Make sure the platform has the gtfs:stop_id so later matches can use it
+                    stop_obj.tags["gtfs:stop_id"] = gtfs_stop_id
+                    
+                    # Find matching snapped position if available
+                    snapped = next((s for s in snapped_stops if s["gtfs:stop_id"] == gtfs_stop_id), None)
+                    if snapped:
+                        stop_pos_node = OSMNode(
+                            id=-1 * random.randint(1, 10**8),
+                            lat=snapped["lat"],
+                            lon=snapped["lon"],
+                            tags={
+                                "public_transport": "stop_position",
+                                "bus": "yes",
+                                "name": stop_obj.tags.get("name", stop_loc["name"]),
+                                "gtfs:stop_id": gtfs_stop_id
+                            }
+                        )
+                        self.nodes.append(stop_pos_node)
+                        relation.add_member(osm_type="node", ref=stop_pos_node.id, role="stop")
+                    
                     relation.add_member(
-                        osm_type="node", ref=stop_object.id, role="platform"
+                        osm_type="node", ref=stop_obj.id, role="platform"
                     )
 
                 # Add ways as members
@@ -355,6 +421,157 @@ class OSMRelationBuilder:
                     relation.add_member(osm_type="way", ref=way_id)
 
                 self.relations.append(relation)
+
+    def _calculate_duration(self, trip_id: str | int, stop_times: pl.DataFrame) -> str | None:
+        """Calculate duration for a trip formatted as HH:MM."""
+        trip_stops = stop_times.filter(pl.col("trip_id") == trip_id).sort("stop_sequence")
+        if trip_stops.height >= 2:
+            first_time = trip_stops.head(1).select("departure_time").row(0)[0]
+            last_time = trip_stops.tail(1).select("arrival_time").row(0)[0]
+            if first_time and last_time:
+                try:
+                    def parse_time(t: str) -> int:
+                        h, m, s = map(int, t.split(':'))
+                        return h * 3600 + m * 60 + s
+                    
+                    duration_secs = parse_time(last_time) - parse_time(first_time)
+                    if duration_secs > 0:
+                        h = duration_secs // 3600
+                        m = (duration_secs % 3600) // 60
+                        return f"{h:02d}:{m:02d}"
+                except Exception:
+                    pass
+        return None
+
+    def _calculate_schedule_tags(
+        self,
+        route_id: str | int,
+        shape_id: str | int,
+        trips: pl.DataFrame,
+        stop_times: pl.DataFrame,
+        calendar: pl.DataFrame | None,
+        frequencies: pl.DataFrame | None
+    ) -> dict[str, str]:
+        """Calculate interval and opening_hours tags based on trip variants and calendar."""
+        variant_trips = trips.filter(
+            (pl.col("route_id").cast(pl.Utf8) == str(route_id)) &
+            (pl.col("shape_id").cast(pl.Utf8) == str(shape_id))
+        )
+        if variant_trips.is_empty():
+            return {}
+
+        tags = {}
+        
+        if calendar is not None and not calendar.is_empty():
+            day_mapping = {
+                "monday": "Mo", "tuesday": "Tu", "wednesday": "We",
+                "thursday": "Th", "friday": "Fr", "saturday": "Sa", "sunday": "Su"
+            }
+            day_schedules = {day: [] for day in day_mapping.values()}
+            day_intervals = {day: [] for day in day_mapping.values()}
+            
+            for trip_row in variant_trips.iter_rows(named=True):
+                tid = trip_row["trip_id"]
+                sid = trip_row["service_id"]
+                
+                cal_row = calendar.filter(pl.col("service_id") == sid)
+                active_days = []
+                if not cal_row.is_empty():
+                    cal_data = cal_row.row(0, named=True)
+                    for gtfs_day, osm_day in day_mapping.items():
+                        if cal_data.get(gtfs_day) == 1:
+                            active_days.append(osm_day)
+                if not active_days:
+                    continue
+                    
+                t_stops = stop_times.filter(pl.col("trip_id") == tid).sort("stop_sequence")
+                if t_stops.height >= 2:
+                    start_time = t_stops.head(1).select("departure_time").row(0)[0]
+                    end_time = t_stops.tail(1).select("arrival_time").row(0)[0]
+                    
+                    interval = None
+                    if frequencies is not None and not frequencies.is_empty():
+                        f_row = frequencies.filter(pl.col("trip_id") == tid)
+                        if not f_row.is_empty():
+                            h_secs = f_row.select("headway_secs").row(0)[0]
+                            interval = int(h_secs) // 60
+                    
+                    if start_time and end_time:
+                        def fmt(t):
+                            parts = t.split(":")
+                            return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+                        try:
+                            s_str = fmt(start_time)
+                            e_str = fmt(end_time)
+                            for d in active_days:
+                                day_schedules[d].append((s_str, e_str))
+                                if interval:
+                                    day_intervals[d].append(interval)
+                        except Exception:
+                            pass
+            
+            final_schedules = {}
+            for d, times in day_schedules.items():
+                if times:
+                    min_s = min(t[0] for t in times)
+                    max_e = max(t[1] for t in times)
+                    if int(max_e.split(":")[0]) >= 24:
+                        h = int(max_e.split(":")[0]) - 24
+                        m = max_e.split(":")[1]
+                        max_e = f"{h:02d}:{m}"
+                    if int(min_s.split(":")[0]) >= 24:
+                        h = int(min_s.split(":")[0]) - 24
+                        m = min_s.split(":")[1]
+                        min_s = f"{h:02d}:{m}"
+                        
+                    sch = f"{min_s}-{max_e}"
+                    interval = min(day_intervals[d]) if day_intervals[d] else None
+                    final_schedules[d] = {"time": sch, "interval": interval}
+                    
+            grouped_schedules = {}
+            for d, data in final_schedules.items():
+                key = (data["time"], data["interval"])
+                if key not in grouped_schedules:
+                    grouped_schedules[key] = []
+                grouped_schedules[key].append(d)
+                
+            oh_parts = []
+            cond_intervals = []
+            
+            for (time_str, interval), days in grouped_schedules.items():
+                day_str = ",".join(days)
+                if day_str == "Mo,Tu,We,Th,Fr":
+                    day_str = "Mo-Fr"
+                elif day_str == "Sa,Su":
+                    day_str = "Sa-Su"
+                elif day_str == "Mo,Tu,We,Th,Fr,Sa,Su":
+                    day_str = "Mo-Su"
+                    
+                oh_parts.append(f"{day_str} {time_str}")
+                if interval:
+                    cond_intervals.append(f"{interval} @ ({day_str} {time_str})")
+                    
+            if oh_parts:
+                tags["opening_hours"] = "; ".join(oh_parts)
+                
+            if cond_intervals:
+                if len(cond_intervals) == 1 and "Mo-Su" in cond_intervals[0]:
+                    tags["interval"] = str(grouped_schedules[list(grouped_schedules.keys())[0]][1])
+                else:
+                    tags["interval:conditional"] = "; ".join(cond_intervals)
+        else:
+            # Fallback to simple interval if no calendar is available
+            trip_ids = variant_trips["trip_id"].to_list()
+            if trip_ids and frequencies is not None and not frequencies.is_empty():
+                trip_freq = frequencies.filter(pl.col("trip_id") == trip_ids[0])
+                if not trip_freq.is_empty():
+                    headway_secs = trip_freq.select("headway_secs").row(0)[0]
+                    try:
+                        tags["interval"] = str(int(headway_secs) // 60)
+                    except Exception:
+                        pass
+                        
+        return tags
 
     def _get_bbox(self, stops: pl.DataFrame) -> tuple[float, float, float, float]:
         """Calculate the bounding box of all stops."""
@@ -527,6 +744,7 @@ class OSMRelationBuilder:
                                         "name": stop_row["name"],
                                         "public_transport": "platform",
                                         "highway": "bus_stop",
+                                        "gtfs:stop_id": str(stop_row["stop_id"])
                                     },
                                 )
                                 if not self.is_stop_duplicate(new_stop):
@@ -658,26 +876,28 @@ class OSMRelationBuilder:
 
         return stop_locations
 
-    def _get_route_ways(
+    def _get_route_ways_and_snaps(
         self,
         shape_id: str | int,
         shapes: pl.DataFrame,
+        stop_locations: pl.DataFrame,
         costing: str = "bus",
         max_retries: int = 3,
         retry_delay: float = 2.0,
-    ) -> list[int]:
+    ) -> tuple[list[int], list[dict]]:
         """
-        Get OSM way IDs for a route between stops using Valhalla API.
+        Get OSM way IDs for a route between stops and snapped stop positions using Valhalla API.
 
         Args:
             shape_id: GTFS shape ID
             shapes: Complete list of GTFS shapes data
+            stop_locations: DataFrame containing lat/lon of stops
             costing: Valhalla costing model to use (bus, auto, pedestrian, etc.)
             max_retries: Maximum number of retry attempts if request fails
             retry_delay: Delay in seconds between retry attempts
 
         Returns:
-            List of unique OSM way IDs that make up the route
+            Tuple of (List of unique OSM way IDs, List of snapped stop dictionaries)
         """
         logger.info(f"Getting OSM ways for route {shape_id}")
 
@@ -686,10 +906,12 @@ class OSMRelationBuilder:
         )
 
         route_ways = []
+        snapped_stops = []
 
         # Get the input data for the request
         valhalla_url = "https://valhalla1.openstreetmap.de/trace_attributes"
-
+        
+        # We trace the detailed shape points to get the exact road ways
         request_json = {
             "shape": filtered_shapes.select(
                 [
@@ -739,7 +961,7 @@ class OSMRelationBuilder:
                     logger.info(
                         f"Found {len(route_ways)} total ways for route {shape_id} variant"
                     )
-                    return route_ways
+                    break
                 else:
                     logger.warning(
                         f"Invalid response from Valhalla (attempt {retry_count + 1}/{max_retries + 1})"
@@ -753,17 +975,57 @@ class OSMRelationBuilder:
             # If we get here, the request failed or the response was invalid
             if retry_count < max_retries:
                 logger.info(f"Retrying in {retry_delay} seconds...")
-                import time
-
                 time.sleep(retry_delay)
                 retry_count += 1
             else:
                 logger.error(f"Failed to get ways after {max_retries + 1} attempts")
                 break
 
-        logger.info(f"Found {len(route_ways)} total ways for route {shape_id} variant")
+        if not stop_locations.is_empty():
+            stops_req = {
+                "shape": stop_locations.select([
+                    pl.struct([
+                        pl.col("lat"),
+                        pl.col("lon"),
+                    ])
+                ]).to_series().to_list(),
+                "costing": costing,
+                "shape_match": "map_snap"
+            }
+            
+            try:
+                # Use trace_attributes on stops to get matched_points
+                stops_resp = requests.post(
+                    valhalla_url,
+                    json=stops_req,
+                    headers={"User-Agent": "gtfstoosm (https://github.com/whubsch/gtfstoosm)"}
+                )
+                if stops_resp.status_code == 200:
+                    results = stops_resp.json()
+                    matched_points = results.get("matched_points", [])
+                    for i, matched in enumerate(matched_points):
+                        if matched and "lat" in matched and "lon" in matched:
+                            stop_id = stop_locations.row(i, named=True)["stop_id"]
+                            snapped_stops.append({
+                                "gtfs:stop_id": str(stop_id),
+                                "lat": matched["lat"],
+                                "lon": matched["lon"]
+                            })
+            except Exception as e:
+                logger.warning(f"Error snapping stops to road network: {e}")
 
-        return route_ways
+        return route_ways, snapped_stops
+        
+    def _get_route_ways(
+        self,
+        shape_id: str | int,
+        shapes: pl.DataFrame,
+        costing: str = "bus",
+        max_retries: int = 3,
+        retry_delay: float = 2.0,
+    ) -> list[int]:
+        ways, _ = self._get_route_ways_and_snaps(shape_id, shapes, pl.DataFrame(), costing, max_retries, retry_delay)
+        return ways
 
     def _get_osm_route_type(self, gtfs_route_type: int | str) -> str:
         """
