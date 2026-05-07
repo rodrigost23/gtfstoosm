@@ -13,7 +13,7 @@ import polars as pl
 import requests
 
 from gtfstoosm.gtfs import GTFSFeed
-from gtfstoosm.osm import OSMElement, OSMNode, OSMRelation
+from gtfstoosm.osm import OSMElement, OSMNode, OSMRelation, RelationMember
 from gtfstoosm.utils import (
     Trip,
     calculate_direction,
@@ -28,10 +28,9 @@ logger = logging.getLogger(__name__)
 class OSMRelationBuilder:
     """Class for building OSM relations from GTFS data."""
 
-    # OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+    OVERPASS_URL = "https://overpass-api.de/api/interpreter"
     # OVERPASS_URL = "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
-    # OVERPASS_URL = "https://overpass.kumi.systems/api/interpreter"
-    OVERPASS_URL = "https://overpass.private.coffee/api/interpreter"
+    # OVERPASS_URL = "https://overpass.private.coffee/api/interpreter"
     USER_AGENT = "gtfstoosm/1.0 (https://github.com/whubsch/gtfstoosm)"
 
     def __init__(
@@ -57,6 +56,7 @@ class OSMRelationBuilder:
         self.relations: list[OSMRelation] = []
         self.nodes: list[OSMNode] = []
         self.new_stops: list[OSMNode] = []
+        self.modified_nodes: list[OSMNode] = []
         self.search_radius: float = search_radius
         self.route_direction: bool = route_direction
         self.route_ref_pattern: str | None = route_ref_pattern
@@ -150,17 +150,38 @@ class OSMRelationBuilder:
                 str(k): str(v) for k, v in route_master_tags.items() if v is not None
             }
 
-            # Reuse existing master ID if found
-            master_id = (
-                existing["master"]["id"]
-                if existing["master"]
-                else -1 * random.randint(1, 10**6)
-            )
-
-            master = OSMRelation(
-                id=master_id,
-                tags=route_master_tags,
-            )
+            # Reuse existing master ID and tags if found
+            if existing["master"]:
+                master_id = existing["master"].id
+                # Preserve existing tags, only update/add from GTFS
+                full_tags = existing["master"].tags.copy()
+                # Preserve existing name tag if present (don't overwrite with GTFS name)
+                existing_master_name = existing["master"].tags.get("name")
+                # Create a copy of GTFS tags to avoid modifying the original
+                update_tags = route_master_tags.copy()
+                if existing_master_name and "name" in update_tags:
+                    del update_tags["name"]
+                full_tags.update(update_tags)
+                
+                master = OSMRelation(
+                    id=master_id,
+                    version=existing["master"].version,
+                    changeset=existing["master"].changeset,
+                    timestamp=existing["master"].timestamp,
+                    user=existing["master"].user,
+                    uid=existing["master"].uid,
+                    tags=full_tags,
+                    members=existing["master"].members.copy() # Start with existing members
+                )
+                # Store original state for functional comparison
+                master.original_tags = existing["master"].original_tags.copy()
+                master.original_members = existing["master"].original_members.copy()
+            else:
+                master_id = -1 * random.randint(1, 10**6)
+                master = OSMRelation(
+                    id=master_id,
+                    tags=route_master_tags,
+                )
 
             # Try to match GTFS sub-routes to existing OSM sub-routes
             available_existing = list(existing["routes"])
@@ -173,7 +194,7 @@ class OSMRelationBuilder:
                             (
                                 r
                                 for r in available_existing
-                                if r.get("tags", {}).get("gtfs:shape_id")
+                                if r.tags.get("gtfs:shape_id")
                                 == route.tags.get("gtfs:shape_id")
                             ),
                             None,
@@ -184,7 +205,7 @@ class OSMRelationBuilder:
                                 (
                                     r
                                     for r in available_existing
-                                    if r.get("tags", {}).get("name")
+                                    if r.tags.get("name")
                                     == route.tags.get("name")
                                 ),
                                 None,
@@ -196,7 +217,7 @@ class OSMRelationBuilder:
                                     r
                                     for r in available_existing
                                     if str(
-                                        r.get("tags", {}).get("gtfs:shape_id", "")
+                                        r.tags.get("gtfs:shape_id", "")
                                     ).startswith(gtfs_route_id)
                                 ),
                                 None,
@@ -207,7 +228,7 @@ class OSMRelationBuilder:
                                 (
                                     r
                                     for r in available_existing
-                                    if r.get("tags", {}).get("gtfs:route_id")
+                                    if r.tags.get("gtfs:route_id")
                                     == gtfs_route_id
                                 ),
                                 None,
@@ -215,12 +236,36 @@ class OSMRelationBuilder:
 
                         if match:
                             logger.info(
-                                f"Matching GTFS route '{route.tags.get('name')}' to existing OSM relation {match['id']}"
+                                f"Matching GTFS route '{route.tags.get('name')}' to existing OSM relation {match.id}"
                             )
-                            route.id = match["id"]
+                            # Update existing relation with GTFS tags and members
+                            # but preserve what was already there
+                            route.id = match.id
+                            route.version = match.version
+                            route.changeset = match.changeset
+                            route.timestamp = match.timestamp
+                            route.user = match.user
+                            route.uid = match.uid
+                            
+                            # Store original state for functional comparison
+                            route.original_tags = match.original_tags.copy()
+                            route.original_members = match.original_members.copy()
+                            
+                            new_tags = match.tags.copy()
+                            # Preserve existing name tag if present (don't overwrite with GTFS name)
+                            existing_name = match.tags.get("name")
+                            if existing_name and "name" in route.tags:
+                                # Use a copy to avoid modifying the original during iteration? 
+                                # Actually route.tags is unique to this route
+                                del route.tags["name"]
+                            new_tags.update(route.tags)
+                            route.tags = new_tags
+                            
                             available_existing.remove(match)
 
-                    master.add_member(osm_type="relation", ref=route.id)
+                    # Only add as member if not already present
+                    if not any(m.type == "relation" and m.ref == route.id for m in master.members):
+                        master.add_member(osm_type="relation", ref=route.id)
 
             self.relations.append(master)
 
@@ -573,13 +618,13 @@ class OSMRelationBuilder:
         (
           rel["type"="route"]["route"="bus"]["ref"="{ref}"]({s},{w},{n},{e});
         )->.routes;
-        
+
         (
           rel(br.routes)["type"="route_master"];
         )->.master;
 
-        .master out tags;
-        .routes out tags;
+        .master out meta;
+        .routes out meta;
         """
 
         try:
@@ -588,7 +633,33 @@ class OSMRelationBuilder:
             )
             if response.status_code == 200:
                 elements = response.json().get("elements", [])
-                master = next(
+
+                # Helper to create OSMRelation from Overpass element
+                def element_to_relation(el):
+                    tags = {str(k): str(v) for k, v in el.get("tags", {}).items()}
+                    rel = OSMRelation(
+                        id=el["id"],
+                        version=el.get("version", 1),
+                        changeset=el.get("changeset"),
+                        timestamp=el.get("timestamp"),
+                        user=el.get("user"),
+                        uid=el.get("uid"),
+                        tags=tags
+                    )
+                    # Capture original state from Overpass for functional comparison
+                    rel.original_tags = tags.copy()
+                    # We don't necessarily need the members here for matching,
+                    # but we store them if they exist in the response
+                    for member in el.get("members", []):
+                        rel.add_member(member["type"], member["ref"], member.get("role", ""))
+                    # Capture original members after they've been added
+                    rel.original_members = [
+                        RelationMember(type=m.type, ref=m.ref, role=m.role)
+                        for m in rel.members
+                    ]
+                    return rel
+
+                master_el = next(
                     (
                         e
                         for e in elements
@@ -596,8 +667,12 @@ class OSMRelationBuilder:
                     ),
                     None,
                 )
+                master = element_to_relation(master_el) if master_el else None
+
                 routes = [
-                    e for e in elements if e.get("tags", {}).get("type") == "route"
+                    element_to_relation(e)
+                    for e in elements
+                    if e.get("tags", {}).get("type") == "route"
                 ]
                 return {"master": master, "routes": routes}
         except Exception as e:
@@ -642,7 +717,7 @@ class OSMRelationBuilder:
         (
         {query_body}
         );
-        out skel;
+        out meta;
         """
 
         max_retries = 3
@@ -681,8 +756,15 @@ class OSMRelationBuilder:
                                 id=int(node_id),
                                 lat=element["lat"],
                                 lon=element["lon"],
+                                version=element.get("version", 1),
+                                changeset=element.get("changeset"),
+                                timestamp=element.get("timestamp"),
+                                user=element.get("user"),
+                                uid=element.get("uid"),
                                 tags=node_tags,
                             )
+                            # Capture original state from Overpass for functional comparison
+                            osm_node.original_tags = node_tags.copy()
                             all_osm_nodes.append(osm_node)
 
                     # Now match each input stop to its nearest OSM node
@@ -708,6 +790,33 @@ class OSMRelationBuilder:
 
                         # Add the closest node (or None if no match within 5m)
                         if closest_node:
+                            # Enrich with missing tags
+                            modified = False
+                            
+                            # Enforce required tags
+                            required_tags = {
+                                "bus": "yes",
+                                "highway": "bus_stop",
+                                "public_transport": "platform",
+                                "gtfs:stop_id": str(stop_row["stop_id"])
+                            }
+                            
+                            # Also add name if missing
+                            if "name" not in closest_node.tags:
+                                required_tags["name"] = str(stop_row["name"])
+
+                            for k, v in required_tags.items():
+                                if closest_node.tags.get(k) != v:
+                                    closest_node.tags[k] = v
+                                    modified = True
+
+                            if modified:
+                                # Track for <modify> section in .osc
+                                if not any(
+                                    n.id == closest_node.id for n in self.modified_nodes
+                                ):
+                                    self.modified_nodes.append(closest_node)
+
                             osm_elements.append(closest_node)
                             # Remove from pool to avoid duplicate matches
                             all_osm_nodes.remove(closest_node)
@@ -1023,7 +1132,10 @@ class OSMRelationBuilder:
                     + [n for n in self.nodes]
                     + [r for r in self.relations if r.id < 0]
                 )
-                to_modify = [r for r in self.relations if r.id > 0]
+                # Only include modified elements that have actual functional changes
+                to_modify = [
+                    r for r in self.relations if r.id > 0 and r.is_functionally_changed()
+                ] + [n for n in self.modified_nodes if n.is_functionally_changed()]
 
                 if to_create:
                     f.write("<create>\n")
