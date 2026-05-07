@@ -303,12 +303,11 @@ class OSMRelationBuilder:
                 # Get the stop locations (with lat and long)
                 stop_locations = self._get_stop_locations(trip_sequence.stops, stops)
                 
-                # Fetch route ways and snapped stop positions using Valhalla
+                # Fetch route ways using Valhalla
                 osm_way_ids = []
-                snapped_stops = []
                 if not self.exclude_routes:
-                    osm_way_ids, snapped_stops = self._get_route_ways_and_snaps(
-                        trip_sequence.shape_id, shapes, stop_locations
+                    osm_way_ids = self._get_route_ways(
+                        trip_sequence.shape_id, shapes
                     )
                 
                 stop_objects = []
@@ -387,30 +386,12 @@ class OSMRelationBuilder:
                     members=[],
                 )
 
-                # Add stop positions and platforms as members
-                # Try to pair them up
+                # Add platforms as members
                 for stop_obj, stop_loc in zip(stop_objects, stop_locations.iter_rows(named=True)):
                     gtfs_stop_id = str(stop_loc["stop_id"])
                     
                     # Make sure the platform has the gtfs:stop_id so later matches can use it
                     stop_obj.tags["gtfs:stop_id"] = gtfs_stop_id
-                    
-                    # Find matching snapped position if available
-                    snapped = next((s for s in snapped_stops if s["gtfs:stop_id"] == gtfs_stop_id), None)
-                    if snapped:
-                        stop_pos_node = OSMNode(
-                            id=-1 * random.randint(1, 10**8),
-                            lat=snapped["lat"],
-                            lon=snapped["lon"],
-                            tags={
-                                "public_transport": "stop_position",
-                                "bus": "yes",
-                                "name": stop_obj.tags.get("name", stop_loc["name"]),
-                                "gtfs:stop_id": gtfs_stop_id
-                            }
-                        )
-                        self.nodes.append(stop_pos_node)
-                        relation.add_member(osm_type="node", ref=stop_pos_node.id, role="stop")
                     
                     relation.add_member(
                         osm_type="node", ref=stop_obj.id, role="platform"
@@ -876,28 +857,26 @@ class OSMRelationBuilder:
 
         return stop_locations
 
-    def _get_route_ways_and_snaps(
+    def _get_route_ways(
         self,
         shape_id: str | int,
         shapes: pl.DataFrame,
-        stop_locations: pl.DataFrame,
         costing: str = "bus",
         max_retries: int = 3,
         retry_delay: float = 2.0,
-    ) -> tuple[list[int], list[dict]]:
+    ) -> list[int]:
         """
-        Get OSM way IDs for a route between stops and snapped stop positions using Valhalla API.
+        Get OSM way IDs for a route using Valhalla API.
 
         Args:
             shape_id: GTFS shape ID
             shapes: Complete list of GTFS shapes data
-            stop_locations: DataFrame containing lat/lon of stops
             costing: Valhalla costing model to use (bus, auto, pedestrian, etc.)
             max_retries: Maximum number of retry attempts if request fails
             retry_delay: Delay in seconds between retry attempts
 
         Returns:
-            Tuple of (List of unique OSM way IDs, List of snapped stop dictionaries)
+            List of unique OSM way IDs that make up the route
         """
         logger.info(f"Getting OSM ways for route {shape_id}")
 
@@ -906,7 +885,6 @@ class OSMRelationBuilder:
         )
 
         route_ways = []
-        snapped_stops = []
 
         # Get the input data for the request
         valhalla_url = "https://valhalla1.openstreetmap.de/trace_attributes"
@@ -981,51 +959,7 @@ class OSMRelationBuilder:
                 logger.error(f"Failed to get ways after {max_retries + 1} attempts")
                 break
 
-        if not stop_locations.is_empty():
-            stops_req = {
-                "shape": stop_locations.select([
-                    pl.struct([
-                        pl.col("lat"),
-                        pl.col("lon"),
-                    ])
-                ]).to_series().to_list(),
-                "costing": costing,
-                "shape_match": "map_snap"
-            }
-            
-            try:
-                # Use trace_attributes on stops to get matched_points
-                stops_resp = requests.post(
-                    valhalla_url,
-                    json=stops_req,
-                    headers={"User-Agent": "gtfstoosm (https://github.com/whubsch/gtfstoosm)"}
-                )
-                if stops_resp.status_code == 200:
-                    results = stops_resp.json()
-                    matched_points = results.get("matched_points", [])
-                    for i, matched in enumerate(matched_points):
-                        if matched and "lat" in matched and "lon" in matched:
-                            stop_id = stop_locations.row(i, named=True)["stop_id"]
-                            snapped_stops.append({
-                                "gtfs:stop_id": str(stop_id),
-                                "lat": matched["lat"],
-                                "lon": matched["lon"]
-                            })
-            except Exception as e:
-                logger.warning(f"Error snapping stops to road network: {e}")
-
-        return route_ways, snapped_stops
-        
-    def _get_route_ways(
-        self,
-        shape_id: str | int,
-        shapes: pl.DataFrame,
-        costing: str = "bus",
-        max_retries: int = 3,
-        retry_delay: float = 2.0,
-    ) -> list[int]:
-        ways, _ = self._get_route_ways_and_snaps(shape_id, shapes, pl.DataFrame(), costing, max_retries, retry_delay)
-        return ways
+        return route_ways
 
     def _get_osm_route_type(self, gtfs_route_type: int | str) -> str:
         """
