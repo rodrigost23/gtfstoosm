@@ -1,21 +1,21 @@
 import datetime
 import logging
-from typing import Literal
-
-from pydantic import BaseModel, Field
+from dataclasses import dataclass, field
+from typing import Literal, Optional, Union
 
 logger = logging.getLogger(__name__)
 
 
-class OSMElement(BaseModel):
+@dataclass(slots=True)
+class OSMElement:
     id: int
     version: int = 1
-    changeset: int | None = None
-    timestamp: datetime.datetime | str | None = None
-    user: str | None = None
-    uid: int | None = None
-    tags: dict[str, str] = Field(default_factory=dict)
-    original_tags: dict[str, str] = Field(default_factory=dict)
+    changeset: Optional[int] = None
+    timestamp: Optional[Union[datetime.datetime, str]] = None
+    user: Optional[str] = None
+    uid: Optional[int] = None
+    tags: dict[str, str] = field(default_factory=dict)
+    original_tags: dict[str, str] = field(default_factory=dict)
     force_conflict: bool = False
 
     def is_functionally_changed(self) -> bool:
@@ -62,9 +62,10 @@ class OSMElement(BaseModel):
         return " ".join(attrs)
 
 
+@dataclass(slots=True)
 class OSMNode(OSMElement):
-    lat: float
-    lon: float
+    lat: float = 0.0
+    lon: float = 0.0
     visible: bool = True
 
     def to_xml(self) -> str:
@@ -76,8 +77,9 @@ class OSMNode(OSMElement):
         return osm_text
 
 
+@dataclass(slots=True)
 class OSMWay(OSMElement):
-    nodes: list[int] = Field(default_factory=list)
+    nodes: list[int] = field(default_factory=list)
     visible: bool = True
 
     def add_node(self, node_id: int) -> None:
@@ -92,7 +94,8 @@ class OSMWay(OSMElement):
         osm_text += "\n</way>"
 
 
-class RelationMember(BaseModel):
+@dataclass(slots=True)
+class RelationMember:
     type: Literal["node", "way", "relation"]
     ref: int
     role: str
@@ -104,9 +107,10 @@ class RelationMember(BaseModel):
         )
 
 
+@dataclass(slots=True)
 class OSMRelation(OSMElement):
-    members: list[RelationMember] = Field(default_factory=list)
-    original_members: list[RelationMember] = Field(default_factory=list)
+    members: list[RelationMember] = field(default_factory=list)
+    original_members: list[RelationMember] = field(default_factory=list)
     visible: bool = True
 
     def is_functionally_changed(self) -> bool:

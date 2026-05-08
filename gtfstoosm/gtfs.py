@@ -7,10 +7,13 @@ It handles the reading and validation of GTFS feeds.
 
 import logging
 import zipfile
+import tempfile
+import os
 from io import BytesIO
+from typing import Optional, Union
 
 import polars as pl
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +28,13 @@ class GTFSFeed(BaseModel):
     """Class for storing and querying a GTFS feed."""
 
     model_config = ConfigDict(
-        arbitrary_types_allowed=True,  # Allow Polars DataFrames
+        arbitrary_types_allowed=True,  # Allow Polars DataFrames/LazyFrames
         validate_assignment=True,
     )
 
     feed_dir: str
-    tables: dict[str, pl.DataFrame] = Field(default_factory=dict)
+    # Store a mix of eager DataFrames and lazy LazyFrames
+    tables: dict[str, Union[pl.DataFrame, pl.LazyFrame]] = Field(default_factory=dict)
     name: str | None = None
     required_files: list[str] = Field(
         default_factory=lambda: [
@@ -74,6 +78,8 @@ class GTFSFeed(BaseModel):
             ],
         }
     )
+
+    _temp_dir: Optional[tempfile.TemporaryDirectory] = PrivateAttr(default=None)
 
     def validate_feed(self, strict: bool = False) -> list[str]:
         """
@@ -126,10 +132,12 @@ class GTFSFeed(BaseModel):
                     try:
                         with zip_ref.open(file) as file_obj:
                             # Read just the header to check columns
+                            # We only read the first few bytes to avoid full file read
                             df = pl.read_csv(
-                                BytesIO(file_obj.read()),
-                                infer_schema_length=None,
+                                BytesIO(file_obj.read(1024)),
+                                infer_schema_length=0,
                                 n_rows=1,
+                                truncate_ragged_lines=True
                             )
 
                             # Check for required columns
@@ -185,17 +193,8 @@ class GTFSFeed(BaseModel):
         """
         Validate referential integrity between GTFS tables.
 
-        This checks that foreign key relationships are valid:
-        - trips.route_id references routes.route_id
-        - stop_times.trip_id references trips.trip_id
-        - stop_times.stop_id references stops.stop_id
-        - etc.
-
-        Returns:
-            List of referential integrity issues found
-
-        Note:
-            This should be called after load() has been called.
+        This checks that foreign key relationships are valid.
+        Note: This is now more expensive with LazyFrames as it requires collection.
         """
         issues: list[str] = []
 
@@ -205,10 +204,20 @@ class GTFSFeed(BaseModel):
             )
             return issues
 
+        # Helper to get unique values from a table (handles both DF and LF)
+        def get_uniques(table_name, col_name):
+            if table_name not in self.tables:
+                return set()
+            table = self.tables[table_name]
+            if isinstance(table, pl.LazyFrame):
+                return set(table.select(col_name).unique().collect()[col_name].to_list())
+            else:
+                return set(table[col_name].unique().to_list())
+
         # Check trips.route_id references routes.route_id
         if "trips" in self.tables and "routes" in self.tables:
-            route_ids = set(self.tables["routes"]["route_id"].to_list())
-            trip_route_ids = set(self.tables["trips"]["route_id"].to_list())
+            route_ids = get_uniques("routes", "route_id")
+            trip_route_ids = get_uniques("trips", "route_id")
             invalid_routes = trip_route_ids - route_ids
 
             if invalid_routes:
@@ -218,8 +227,8 @@ class GTFSFeed(BaseModel):
 
         # Check stop_times.trip_id references trips.trip_id
         if "stop_times" in self.tables and "trips" in self.tables:
-            trip_ids = set(self.tables["trips"]["trip_id"].to_list())
-            stop_time_trip_ids = set(self.tables["stop_times"]["trip_id"].to_list())
+            trip_ids = get_uniques("trips", "trip_id")
+            stop_time_trip_ids = get_uniques("stop_times", "trip_id")
             invalid_trips = stop_time_trip_ids - trip_ids
 
             if invalid_trips:
@@ -229,8 +238,8 @@ class GTFSFeed(BaseModel):
 
         # Check stop_times.stop_id references stops.stop_id
         if "stop_times" in self.tables and "stops" in self.tables:
-            stop_ids = set(self.tables["stops"]["stop_id"].to_list())
-            stop_time_stop_ids = set(self.tables["stop_times"]["stop_id"].to_list())
+            stop_ids = get_uniques("stops", "stop_id")
+            stop_time_stop_ids = get_uniques("stop_times", "stop_id")
             invalid_stops = stop_time_stop_ids - stop_ids
 
             if invalid_stops:
@@ -238,38 +247,13 @@ class GTFSFeed(BaseModel):
                     f"ERROR: stop_times.stop_id contains {len(invalid_stops)} invalid references to stops.stop_id"
                 )
 
-        # Check shapes reference if trips use shape_id
-        if "trips" in self.tables and "shapes" in self.tables:
-            if "shape_id" in self.tables["trips"].columns:
-                shape_ids = set(self.tables["shapes"]["shape_id"].to_list())
-                # Filter out null/empty shape_ids
-                trip_shape_ids = set(
-                    self.tables["trips"]
-                    .filter(pl.col("shape_id").is_not_null())["shape_id"]
-                    .to_list()
-                )
-                invalid_shapes = trip_shape_ids - shape_ids
-
-                if invalid_shapes:
-                    issues.append(
-                        f"ERROR: trips.shape_id contains {len(invalid_shapes)} invalid references to shapes.shape_id"
-                    )
-
         # Check data completeness
-        if "stop_times" in self.tables:
-            stop_times_count = self.tables["stop_times"].height
-            if stop_times_count == 0:
-                issues.append("ERROR: stop_times.txt is empty")
-
-        if "stops" in self.tables:
-            stops_count = self.tables["stops"].height
-            if stops_count == 0:
-                issues.append("ERROR: stops.txt is empty")
-
-        if "routes" in self.tables:
-            routes_count = self.tables["routes"].height
-            if routes_count == 0:
-                issues.append("ERROR: routes.txt is empty")
+        for table_name in ["stop_times", "stops", "routes"]:
+            if table_name in self.tables:
+                table = self.tables[table_name]
+                height = table.select(pl.len()).collect().item() if isinstance(table, pl.LazyFrame) else table.height
+                if height == 0:
+                    issues.append(f"ERROR: {table_name}.txt is empty")
 
         if not issues:
             issues.append("INFO: Referential integrity validation passed")
@@ -278,22 +262,16 @@ class GTFSFeed(BaseModel):
 
     def load(self, validate_feed: bool = True, strict: bool = False) -> None:
         """
-        Load a GTFS feed.
+        Load a GTFS feed into Polars DataFrames/LazyFrames by extracting to a temp directory.
 
         Args:
             validate_feed: If True, validates the feed structure before loading
             strict: If True, raises exception on validation failures
-
-        Raises:
-            GTFSValidationError: If validation fails and strict=True
-            FileNotFoundError: If the feed file doesn't exist
-            zipfile.BadZipFile: If the feed file is not a valid zip
         """
         # Validate feed structure first
         if validate_feed:
             validation_issues = self.validate_feed(strict=strict)
 
-            # Log validation results
             for issue in validation_issues:
                 if issue.startswith("ERROR:"):
                     logger.error(issue)
@@ -302,53 +280,55 @@ class GTFSFeed(BaseModel):
                 else:
                     logger.info(issue)
 
-            # Check if there were any errors
             has_errors = any(issue.startswith("ERROR:") for issue in validation_issues)
             if has_errors and strict:
                 raise GTFSValidationError(
                     "Feed validation failed. See logs for details."
                 )
 
-        # Read all files in the feed directory
+        # Create temporary directory for extraction
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="gtfstoosm_")
+        temp_path = self._temp_dir.name
+        logger.debug(f"Extracting GTFS to {temp_path}")
+
         try:
             with zipfile.ZipFile(self.feed_dir, "r") as zip_ref:
-                all_txt_files = [f for f in zip_ref.namelist() if f.endswith(".txt")]
-
-                for file in all_txt_files:
-                    table_name = file[:-4]  # Remove the .txt extension
-
-                    # Skip if not in required or optional files
-                    if (
-                        file not in self.required_files
-                        and file not in self.optional_files
-                    ):
-                        logger.debug(f"Skipping unknown file {file}")
-                        continue
-
-                    try:
-                        logger.debug(f"Loading {file}")
-                        with zip_ref.open(file) as file_obj:
-                            # Read the CSV data into a polars DataFrame
-                            df = pl.read_csv(
-                                BytesIO(file_obj.read()), infer_schema_length=None
-                            )
-
-                            logger.info(f"Loaded {df.height:,} records from {file}")
+                all_files = zip_ref.namelist()
+                
+                # Hybrid Strategy:
+                # Eager (Small/Metadata): agency, stops, routes, calendar
+                # Lazy (Big/Data): stop_times, trips, shapes
+                metadata_files = {"agency.txt", "stops.txt", "routes.txt", "calendar.txt", "calendar_dates.txt"}
+                
+                needed_files = set(self.required_files) | set(self.optional_files)
+                for file in all_files:
+                    if file in needed_files:
+                        logger.debug(f"Extracting {file}")
+                        zip_ref.extract(file, temp_path)
+                        
+                        table_name = file[:-4]
+                        file_path = os.path.join(temp_path, file)
+                        
+                        if file in metadata_files:
+                            # Eagerly read small metadata files (Ensures perfect types for math)
+                            df = pl.read_csv(file_path, infer_schema_length=None)
+                            logger.info(f"Loaded eager metadata: {file} ({df.height:,} records)")
                             self.tables[table_name] = df
-
-                    except Exception as e:
-                        logger.error(f"Failed to load {file}: {str(e)}")
-                        if strict:
-                            raise
+                        else:
+                            # Lazily scan large data files (Memory mapped from disk)
+                            # Use 10k rows for schema inference to ensure speed + accuracy
+                            self.tables[table_name] = pl.scan_csv(
+                                file_path, 
+                                infer_schema_length=10000,
+                                rechunk=False
+                            )
+                            logger.info(f"Initialized lazy scan: {file} (Disk-backed)")
 
                 # Check if we loaded required files
-                loaded_required = [
-                    f for f in self.required_files if f[:-4] in self.tables
+                missing = [
+                    f for f in self.required_files if f[:-4] not in self.tables
                 ]
-                if len(loaded_required) < len(self.required_files):
-                    missing = [
-                        f for f in self.required_files if f[:-4] not in self.tables
-                    ]
+                if missing:
                     error_msg = f"Failed to load required files: {', '.join(missing)}"
                     logger.error(error_msg)
                     if strict:
@@ -358,3 +338,15 @@ class GTFSFeed(BaseModel):
             raise ValueError(
                 f"The file at {self.feed_dir} is not a valid zip file"
             ) from err
+        except Exception as e:
+            logger.error(f"Error loading GTFS feed: {str(e)}")
+            if strict:
+                raise
+            
+    def __del__(self):
+        """Cleanup temporary directory when the object is destroyed."""
+        if hasattr(self, "_temp_dir") and self._temp_dir:
+            try:
+                self._temp_dir.cleanup()
+            except Exception:
+                pass

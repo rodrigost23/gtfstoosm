@@ -81,7 +81,7 @@ class OSMRelationBuilder:
             f"OSMRelationBuilder({', '.join(f'{k}={v!r}' for k, v in attrs.items())})"
         )
 
-    def build_relations(self, gtfs_data: dict[str, pl.DataFrame]) -> None:
+    def build_relations(self, gtfs_data: dict[str, pl.DataFrame | pl.LazyFrame]) -> None:
         """
         Build OSM relations from GTFS data.
 
@@ -142,7 +142,7 @@ class OSMRelationBuilder:
 
         return merged
 
-    def build_route_masters(self, gtfs_data: dict[str, pl.DataFrame]) -> None:
+    def build_route_masters(self, gtfs_data: dict[str, pl.DataFrame | pl.LazyFrame]) -> None:
         """
         Create route_master relations for routes with the same ref.
         """
@@ -151,10 +151,25 @@ class OSMRelationBuilder:
         # Get bbox for Overpass queries
         bbox = self._get_bbox(gtfs_data["stops"])
 
-        made_routes = {variant.tags["ref"] for variant in self.relations}
-        unique_routes = gtfs_data["routes"].filter(
-            pl.col("route_short_name").cast(pl.Utf8).is_in(made_routes)
-        )
+        # Get unique route short names that have been processed as variants
+        made_refs = {variant.tags["ref"] for variant in self.relations if variant.tags.get("type") == "route"}
+        
+        # Filter routes and ensure uniqueness by route_short_name (ref)
+        # Handle both DF and LF
+        routes_table = gtfs_data["routes"]
+        if isinstance(routes_table, pl.LazyFrame):
+            unique_routes = (
+                routes_table
+                .filter(pl.col("route_short_name").cast(pl.Utf8).is_in(list(made_refs)))
+                .unique(subset=["route_short_name"])
+                .collect()
+            )
+        else:
+            unique_routes = (
+                routes_table
+                .filter(pl.col("route_short_name").cast(pl.Utf8).is_in(list(made_refs)))
+                .unique(subset=["route_short_name"])
+            )
 
         for unique_route in unique_routes.iter_rows(named=True):
             route_ref = str(unique_route["route_short_name"])
@@ -174,18 +189,22 @@ class OSMRelationBuilder:
                 "gtfs:route_id": gtfs_route_id,
             }
 
-            if "agency" in gtfs_data and not gtfs_data["agency"].is_empty():
-                agency_id = unique_route.get("agency_id")
-                agency_row = None
-                if agency_id is not None:
-                    agency_matches = gtfs_data["agency"].filter(pl.col("agency_id") == agency_id)
-                    if not agency_matches.is_empty():
-                        agency_row = agency_matches.row(0, named=True)
-                if not agency_row:
-                    agency_row = gtfs_data["agency"].row(0, named=True)
-                if agency_row and "agency_name" in agency_row and agency_row["agency_name"]:
-                    route_master_tags["operator"] = str(agency_row["agency_name"])
-                    route_master_tags["network"] = str(agency_row["agency_name"])
+            if "agency" in gtfs_data:
+                agency_table = gtfs_data["agency"]
+                agency_data = agency_table if isinstance(agency_table, pl.DataFrame) else agency_table.collect()
+                
+                if not agency_data.is_empty():
+                    agency_id = unique_route.get("agency_id")
+                    agency_row = None
+                    if agency_id is not None:
+                        agency_matches = agency_data.filter(pl.col("agency_id") == agency_id)
+                        if not agency_matches.is_empty():
+                            agency_row = agency_matches.row(0, named=True)
+                    if not agency_row:
+                        agency_row = agency_data.row(0, named=True)
+                    if agency_row and "agency_name" in agency_row and agency_row["agency_name"]:
+                        route_master_tags["operator"] = str(agency_row["agency_name"])
+                        route_master_tags["network"] = str(agency_row["agency_name"])
 
             if unique_route.get("route_color"):
                 route_master_tags["colour"] = "#" + str(
@@ -216,7 +235,9 @@ class OSMRelationBuilder:
                 
                 # Store original state for functional comparison
                 master.original_tags = existing["master"].original_tags.copy()
-                master.original_members = existing["master"].original_members.copy()
+                # Store original members from the matched relation (hashing type/ref/role for memory safety?)
+                # Actually, let's just use what we have in OSMRelation
+                master.original_members = existing["master"].members.copy()
                 
                 # Use Faithful Editor merging strategy for tags
                 master.tags = self._merge_tags(existing["master"].tags, master.tags)
@@ -224,101 +245,105 @@ class OSMRelationBuilder:
                 # Always force conflict to version="1" when matching existing relations
                 master.force_conflict = (self.merge_strategy == "conflict")
 
-            # Try to match GTFS sub-routes to existing OSM sub-routes
+            # Match variants to this master by searching CURRENT relations list
+            # We ONLY look for type=route to avoid recursive master nesting
             available_existing = list(existing["routes"])
-            for route in self.relations:
-                if route.tags.get("ref") == route_ref:
-                    logger.debug(f"Attempting to match GTFS route '{route.tags.get('name')}' (shape_id: {route.tags.get('gtfs:shape_id')})")
-                    # If we have existing sub-routes, try to match by name or gtfs:route_id or gtfs:shape_id
-                    match = None
-                    if available_existing:
-                        # 1. Match by gtfs:shape_id
+            
+            # Identify all variants that belong to this master (same ref)
+            master_variants = [r for r in self.relations if r.tags.get("type") == "route" and r.tags.get("ref") == route_ref]
+            
+            for route in master_variants:
+                logger.debug(f"Attempting to match GTFS route '{route.tags.get('name')}' (shape_id: {route.tags.get('gtfs:shape_id')})")
+                # If we have existing sub-routes, try to match by name or gtfs:route_id or gtfs:shape_id
+                match = None
+                if available_existing:
+                    # 1. Match by gtfs:shape_id
+                    match = next(
+                        (
+                            r
+                            for r in available_existing
+                            if r.tags.get("gtfs:shape_id")
+                            == route.tags.get("gtfs:shape_id")
+                        ),
+                        None,
+                    )
+                    if match:
+                        logger.debug(f"  Matched by gtfs:shape_id: {match.id}")
+
+                    if not match:
+                        # 2. Match by gtfs:route_id
                         match = next(
                             (
                                 r
                                 for r in available_existing
-                                if r.tags.get("gtfs:shape_id")
-                                == route.tags.get("gtfs:shape_id")
+                                if r.tags.get("gtfs:route_id")
+                                == gtfs_route_id
                             ),
                             None,
                         )
                         if match:
-                            logger.debug(f"  Matched by gtfs:shape_id: {match.id}")
+                            logger.debug(f"  Matched by gtfs:route_id: {match.id}")
 
-                        if not match:
-                            # 2. Match by gtfs:route_id
-                            match = next(
-                                (
-                                    r
-                                    for r in available_existing
-                                    if r.tags.get("gtfs:route_id")
-                                    == gtfs_route_id
-                                ),
-                                None,
-                            )
-                            if match:
-                                logger.debug(f"  Matched by gtfs:route_id: {match.id}")
-
-                        if not match:
-                            # 3. Match by name
-                            match = next(
-                                (
-                                    r
-                                    for r in available_existing
-                                    if r.tags.get("name")
-                                    == route.tags.get("name")
-                                ),
-                                None,
-                            )
-                            if match:
-                                logger.debug(f"  Matched by exact name: {match.id}")
-                        
-                        if not match:
-                            # 4. Match by shape_id prefix
-                            match = next(
-                                (
-                                    r
-                                    for r in available_existing
-                                    if str(
-                                        r.tags.get("gtfs:shape_id", "")
-                                    ).startswith(gtfs_route_id)
-                                ),
-                                None,
-                            )
-                            if match:
-                                logger.debug(f"  Matched by shape_id prefix: {match.id}")
-
-                        if not match:
-                            logger.debug("  No match found among existing OSM relations")
-
+                    if not match:
+                        # 3. Match by name
+                        match = next(
+                            (
+                                r
+                                for r in available_existing
+                                if r.tags.get("name")
+                                == route.tags.get("name")
+                            ),
+                            None,
+                        )
                         if match:
-                            logger.info(
-                                f"Matching GTFS route '{route.tags.get('name')}' to existing OSM relation {match.id}"
-                            )
-                            # Update existing relation with GTFS identity metadata
-                            # but KEEP the GTFS-generated member list (GTFS Truth)
-                            route.id = match.id
-                            route.version = match.version
-                            route.changeset = match.changeset
-                            route.timestamp = match.timestamp
-                            route.user = match.user
-                            route.uid = match.uid
-                            
-                            # Store original state for functional comparison
-                            route.original_tags = match.original_tags.copy()
-                            route.original_members = match.original_members.copy()
-                            
-                            # Use Faithful Editor merging strategy for tags
-                            route.tags = self._merge_tags(match.tags, route.tags)
-                            
-                            # Always force conflict to version="1" when matching existing relations
-                            route.force_conflict = (self.merge_strategy == "conflict")
-                            
-                            available_existing.remove(match)
+                            logger.debug(f"  Matched by exact name: {match.id}")
+                    
+                    if not match:
+                        # 4. Match by shape_id prefix
+                        match = next(
+                            (
+                                r
+                                for r in available_existing
+                                if str(
+                                    r.tags.get("gtfs:shape_id", "")
+                                ).startswith(gtfs_route_id)
+                            ),
+                            None,
+                        )
+                        if match:
+                            logger.debug(f"  Matched by shape_id prefix: {match.id}")
 
-                    # Only add as member if not already present
-                    if not any(m.type == "relation" and m.ref == route.id for m in master.members):
-                        master.add_member(osm_type="relation", ref=route.id)
+                    if not match:
+                        logger.debug("  No match found among existing OSM relations")
+
+                    if match:
+                        logger.info(
+                            f"Matching GTFS route '{route.tags.get('name')}' to existing OSM relation {match.id}"
+                        )
+                        # Update existing relation with GTFS identity metadata
+                        # but KEEP the GTFS-generated member list (GTFS Truth)
+                        route.id = match.id
+                        route.version = match.version
+                        route.changeset = match.changeset
+                        route.timestamp = match.timestamp
+                        route.user = match.user
+                        route.uid = match.uid
+                        
+                        # Store original state for functional comparison
+                        route.original_tags = match.tags.copy()
+                        route.original_members = match.members.copy()
+                        
+                        # Use Faithful Editor merging strategy for tags
+                        route.tags = self._merge_tags(match.tags, route.tags)
+                        
+                        # Always force conflict to version="1" when matching existing relations
+                        route.force_conflict = (self.merge_strategy == "conflict")
+                        
+                        available_existing.remove(match)
+
+                # Only add as member if not already present
+                if not any(m.type == "relation" and m.ref == route.id for m in master.members):
+                    master.add_member(osm_type="relation", ref=route.id)
 
             self.relations.append(master)
 
@@ -326,47 +351,52 @@ class OSMRelationBuilder:
             f"Built {len([i for i in self.relations if i.tags.get('route_master')])} route_master relations"
         )
 
-    def _process_routes(self, gtfs_data: dict[str, pl.DataFrame]) -> None:
+    def _process_routes(self, gtfs_data: dict[str, pl.DataFrame | pl.LazyFrame]) -> None:
         """
         Process GTFS routes and convert them to OSM relations.
 
         Args:
             gtfs_data: Complete GTFS data dictionary
         """
-        routes = gtfs_data["routes"]
-        trips = gtfs_data["trips"]
-        stop_times = gtfs_data["stop_times"]
-        stops = gtfs_data["stops"]
-        shapes = gtfs_data["shapes"]
-        frequencies = gtfs_data.get("frequencies", None)
-        calendar = gtfs_data.get("calendar", None)
+        routes_table = gtfs_data["routes"]
+        trips_table = gtfs_data["trips"]
+        stop_times_table = gtfs_data["stop_times"]
+        stops_table = gtfs_data["stops"]
+        shapes_table = gtfs_data["shapes"]
+        frequencies_table = gtfs_data.get("frequencies")
+        calendar_table = gtfs_data.get("calendar")
 
-        logger.info(f"Processing {routes.height} routes")
+        # Start lazy where possible
+        routes_lf = routes_table if isinstance(routes_table, pl.LazyFrame) else routes_table.lazy()
+        trips_lf = trips_table if isinstance(trips_table, pl.LazyFrame) else trips_table.lazy()
+        stop_times_lf = stop_times_table if isinstance(stop_times_table, pl.LazyFrame) else stop_times_table.lazy()
 
         # Filter routes by type if specified
         if self.route_types:
-            routes = routes.filter(pl.col("route_type").is_in(self.route_types))
+            routes_lf = routes_lf.filter(pl.col("route_type").is_in(self.route_types))
 
         # Filter routes by regex pattern if specified
         if self.route_ref_pattern is not None:
-            routes_to_process = routes.filter(
+            routes_lf = routes_lf.filter(
                 pl.col("route_id").cast(pl.Utf8).str.contains(self.route_ref_pattern)
             )
-            logger.debug(
-                f"Filtered to routes matching pattern '{self.route_ref_pattern}'"
-            )
-        else:
-            routes_to_process = routes
 
+        # Collect routes to process
+        routes_to_process = routes_lf.collect()
         logger.info(f"Processing {routes_to_process.height} filtered routes")
 
-        # Process routes using vectorized operations
+        if routes_to_process.is_empty():
+            return
+
+        # Perform massive join lazily and only for target routes
+        # This is the heavy lifting
         route_trip_stops = (
-            trips.join(stop_times, on="trip_id")
+            trips_lf.join(stop_times_lf, on="trip_id")
             .filter(pl.col("route_id").is_in(routes_to_process["route_id"].to_list()))
             .sort(["route_id", "trip_id", "stop_sequence"])
             .group_by(["route_id", "trip_id", "shape_id"], maintain_order=True)
             .agg([pl.col("stop_id").alias("stops")])
+            .collect()
         )
 
         # Process all routes at once instead of looping
@@ -399,13 +429,13 @@ class OSMRelationBuilder:
             # Process each unique stop pattern
             for trip_sequence in trip_sequences:
                 # Get the stop locations (with lat and long)
-                stop_locations = self._get_stop_locations(trip_sequence.stops, stops)
+                stop_locations = self._get_stop_locations(trip_sequence.stops, stops_table)
                 
                 # Fetch route ways using Valhalla
                 osm_way_ids = []
                 if not self.exclude_routes:
                     osm_way_ids = self._get_route_ways(
-                        trip_sequence.shape_id, shapes
+                        trip_sequence.shape_id, shapes_table
                     )
                 
                 stop_objects = []
@@ -438,7 +468,7 @@ class OSMRelationBuilder:
                 }
                 
                 # Add Duration
-                duration = self._calculate_duration(trip_sequence.trip_id, stop_times)
+                duration = self._calculate_duration(trip_sequence.trip_id, stop_times_table)
                 if duration:
                     route_tags["duration"] = duration
                     
@@ -446,25 +476,28 @@ class OSMRelationBuilder:
                 schedule_tags = self._calculate_schedule_tags(
                     route_info.get("route_id", ""),
                     trip_sequence.shape_id,
-                    trips,
-                    stop_times,
-                    calendar,
-                    frequencies
+                    trips_table,
+                    stop_times_table,
+                    calendar_table,
+                    frequencies_table
                 )
                 route_tags.update(schedule_tags)
                 
-                if "agency" in gtfs_data and not gtfs_data["agency"].is_empty():
-                    agency_id = route_info.get("agency_id")
-                    agency_row = None
-                    if agency_id is not None:
-                        agency_matches = gtfs_data["agency"].filter(pl.col("agency_id") == agency_id)
-                        if not agency_matches.is_empty():
-                            agency_row = agency_matches.row(0, named=True)
-                    if not agency_row:
-                        agency_row = gtfs_data["agency"].row(0, named=True)
-                    if agency_row and "agency_name" in agency_row and agency_row["agency_name"]:
-                        route_tags["operator"] = str(agency_row["agency_name"])
-                        route_tags["network"] = str(agency_row["agency_name"])
+                if "agency" in gtfs_data:
+                    agency_table = gtfs_data["agency"]
+                    agency_data = agency_table if isinstance(agency_table, pl.DataFrame) else agency_table.collect()
+                    if not agency_data.is_empty():
+                        agency_id = route_info.get("agency_id")
+                        agency_row = None
+                        if agency_id is not None:
+                            agency_matches = agency_data.filter(pl.col("agency_id") == agency_id)
+                            if not agency_matches.is_empty():
+                                agency_row = agency_matches.row(0, named=True)
+                        if not agency_row:
+                            agency_row = agency_data.row(0, named=True)
+                        if agency_row and "agency_name" in agency_row and agency_row["agency_name"]:
+                            route_tags["operator"] = str(agency_row["agency_name"])
+                            route_tags["network"] = str(agency_row["agency_name"])
 
                 route_color = route_info.get("route_color")
                 if route_color and len(str(route_color).strip("#")) in (3, 6):
@@ -501,9 +534,11 @@ class OSMRelationBuilder:
 
                 self.relations.append(relation)
 
-    def _calculate_duration(self, trip_id: str | int, stop_times: pl.DataFrame) -> str | None:
+    def _calculate_duration(self, trip_id: str | int, stop_times: pl.DataFrame | pl.LazyFrame) -> str | None:
         """Calculate duration for a trip formatted as HH:MM."""
-        trip_stops = stop_times.filter(pl.col("trip_id") == trip_id).sort("stop_sequence")
+        st_lf = stop_times if isinstance(stop_times, pl.LazyFrame) else stop_times.lazy()
+        trip_stops = st_lf.filter(pl.col("trip_id") == str(trip_id)).sort("stop_sequence").collect()
+        
         if trip_stops.height >= 2:
             first_time = trip_stops.head(1).select("departure_time").row(0)[0]
             last_time = trip_stops.tail(1).select("arrival_time").row(0)[0]
@@ -526,22 +561,28 @@ class OSMRelationBuilder:
         self,
         route_id: str | int,
         shape_id: str | int,
-        trips: pl.DataFrame,
-        stop_times: pl.DataFrame,
-        calendar: pl.DataFrame | None,
-        frequencies: pl.DataFrame | None
+        trips: pl.DataFrame | pl.LazyFrame,
+        stop_times: pl.DataFrame | pl.LazyFrame,
+        calendar: pl.DataFrame | pl.LazyFrame | None,
+        frequencies: pl.DataFrame | pl.LazyFrame | None
     ) -> dict[str, str]:
         """Calculate interval and opening_hours tags based on trip variants and calendar."""
-        variant_trips = trips.filter(
+        t_lf = trips if isinstance(trips, pl.LazyFrame) else trips.lazy()
+        variant_trips = t_lf.filter(
             (pl.col("route_id").cast(pl.Utf8) == str(route_id)) &
             (pl.col("shape_id").cast(pl.Utf8) == str(shape_id))
-        )
+        ).collect()
+
         if variant_trips.is_empty():
             return {}
 
         tags = {}
         
-        if calendar is not None and not calendar.is_empty():
+        cal_data = None
+        if calendar is not None:
+            cal_data = calendar if isinstance(calendar, pl.DataFrame) else calendar.collect()
+
+        if cal_data is not None and not cal_data.is_empty():
             day_mapping = {
                 "monday": "Mo", "tuesday": "Tu", "wednesday": "We",
                 "thursday": "Th", "friday": "Fr", "saturday": "Sa", "sunday": "Su"
@@ -549,28 +590,33 @@ class OSMRelationBuilder:
             day_schedules = {day: [] for day in day_mapping.values()}
             day_intervals = {day: [] for day in day_mapping.values()}
             
+            st_lf = stop_times if isinstance(stop_times, pl.LazyFrame) else stop_times.lazy()
+            freq_data = None
+            if frequencies is not None:
+                freq_data = frequencies if isinstance(frequencies, pl.DataFrame) else frequencies.collect()
+
             for trip_row in variant_trips.iter_rows(named=True):
                 tid = trip_row["trip_id"]
                 sid = trip_row["service_id"]
                 
-                cal_row = calendar.filter(pl.col("service_id") == sid)
+                cal_row = cal_data.filter(pl.col("service_id") == sid)
                 active_days = []
                 if not cal_row.is_empty():
-                    cal_data = cal_row.row(0, named=True)
+                    cal_row_data = cal_row.row(0, named=True)
                     for gtfs_day, osm_day in day_mapping.items():
-                        if cal_data.get(gtfs_day) == 1:
+                        if cal_row_data.get(gtfs_day) == 1:
                             active_days.append(osm_day)
                 if not active_days:
                     continue
                     
-                t_stops = stop_times.filter(pl.col("trip_id") == tid).sort("stop_sequence")
+                t_stops = st_lf.filter(pl.col("trip_id") == tid).sort("stop_sequence").collect()
                 if t_stops.height >= 2:
                     start_time = t_stops.head(1).select("departure_time").row(0)[0]
                     end_time = t_stops.tail(1).select("arrival_time").row(0)[0]
                     
                     interval = None
-                    if frequencies is not None and not frequencies.is_empty():
-                        f_row = frequencies.filter(pl.col("trip_id") == tid)
+                    if freq_data is not None and not freq_data.is_empty():
+                        f_row = freq_data.filter(pl.col("trip_id") == tid)
                         if not f_row.is_empty():
                             h_secs = f_row.select("headway_secs").row(0)[0]
                             interval = int(h_secs) // 60
@@ -635,14 +681,18 @@ class OSMRelationBuilder:
                 
             if cond_intervals:
                 if len(cond_intervals) == 1 and "Mo-Su" in cond_intervals[0]:
-                    tags["interval"] = str(grouped_schedules[list(grouped_schedules.keys())[0]][1])
+                    tags["interval"] = str(list(grouped_schedules.keys())[0][1])
                 else:
                     tags["interval:conditional"] = "; ".join(cond_intervals)
         else:
             # Fallback to simple interval if no calendar is available
             trip_ids = variant_trips["trip_id"].to_list()
-            if trip_ids and frequencies is not None and not frequencies.is_empty():
-                trip_freq = frequencies.filter(pl.col("trip_id") == trip_ids[0])
+            freq_data = None
+            if frequencies is not None:
+                freq_data = frequencies if isinstance(frequencies, pl.DataFrame) else frequencies.collect()
+                
+            if trip_ids and freq_data is not None and not freq_data.is_empty():
+                trip_freq = freq_data.filter(pl.col("trip_id") == trip_ids[0])
                 if not trip_freq.is_empty():
                     headway_secs = trip_freq.select("headway_secs").row(0)[0]
                     try:
@@ -652,21 +702,40 @@ class OSMRelationBuilder:
                         
         return tags
 
-    def _get_bbox(self, stops: pl.DataFrame, buffer_meters: float = 50.0) -> tuple[float, float, float, float]:
+    def _get_bbox(
+        self, 
+        stops: pl.DataFrame | pl.LazyFrame, 
+        buffer_meters: float = 50.0,
+        lat_col: str = "stop_lat",
+        lon_col: str = "stop_lon"
+    ) -> tuple[float, float, float, float]:
         """Calculate the bounding box of all stops with a safety buffer."""
-        if stops.is_empty():
+        # Handle both DF and LF
+        stops_lf = stops if isinstance(stops, pl.LazyFrame) else stops.lazy()
+        
+        # Cast to Float64 before aggregation to ensure schema works even with infer_schema_length=0
+        stops_stats = stops_lf.select([
+            pl.col(lat_col).cast(pl.Float64).min().alias("min_lat"),
+            pl.col(lon_col).cast(pl.Float64).min().alias("min_lon"),
+            pl.col(lat_col).cast(pl.Float64).max().alias("max_lat"),
+            pl.col(lon_col).cast(pl.Float64).max().alias("max_lon"),
+            pl.col(lat_col).cast(pl.Float64).mean().alias("avg_lat"),
+            pl.len().alias("count")
+        ]).collect()
+
+        if stops_stats["count"][0] == 0:
             return (0.0, 0.0, 0.0, 0.0)
-            
+
         # Approximation: 1 degree ~= 111km
         lat_buffer = buffer_meters / 111000.0
-        avg_lat = stops["stop_lat"].mean()
+        avg_lat = stops_stats["avg_lat"][0]
         lon_buffer = buffer_meters / (111000.0 * abs(math.cos(math.radians(avg_lat))))
 
         return (
-            stops["stop_lat"].min() - lat_buffer,
-            stops["stop_lon"].min() - lon_buffer,
-            stops["stop_lat"].max() + lat_buffer,
-            stops["stop_lon"].max() + lon_buffer,
+            stops_stats["min_lat"][0] - lat_buffer,
+            stops_stats["min_lon"][0] - lon_buffer,
+            stops_stats["max_lat"][0] + lat_buffer,
+            stops_stats["max_lon"][0] + lon_buffer,
         )
 
     def _find_existing_routes(
@@ -802,9 +871,12 @@ class OSMRelationBuilder:
         osm_elements: list[OSMElement] = []
 
         # Calculate BBox from the stops with a buffer
-        # We rename columns temporarily to match _get_bbox expectations
-        bbox_stops = stops.rename({"lat": "stop_lat", "lon": "stop_lon"})
-        s, w, n, e = self._get_bbox(bbox_stops, buffer_meters=max_distance * 2)
+        s, w, n, e = self._get_bbox(
+            stops, 
+            buffer_meters=max_distance * 2,
+            lat_col="lat",
+            lon_col="lon"
+        )
 
         query = f"""
         [out:json][timeout:60];
@@ -1042,7 +1114,7 @@ class OSMRelationBuilder:
         return c * r
 
     def _get_stop_locations(
-        self, stop_ids: list[int], stops: pl.DataFrame
+        self, stop_ids: list[str | int], stops: pl.DataFrame | pl.LazyFrame
     ) -> pl.DataFrame:
         """
         Get location information for a list of stop IDs.
@@ -1052,15 +1124,18 @@ class OSMRelationBuilder:
             stops: Complete list of GTFS stops data
 
         Returns:
-            List of dictionaries containing stop information with lat and lon
+            DataFrame containing stop information with lat and lon
         """
         # Create a DataFrame from stop_ids to preserve order
-        stop_ids_df = pl.DataFrame({"stop_id": stop_ids, "order": range(len(stop_ids))})
+        stop_ids_df = pl.DataFrame({"stop_id": [str(s) for s in stop_ids], "order": range(len(stop_ids))}).lazy()
 
         # Join with stops data and sort by original order
+        # Ensure stops is lazy
+        stops_lf = stops if isinstance(stops, pl.LazyFrame) else stops.lazy()
+        
         stop_locations = (
             stop_ids_df.join(
-                stops.select(["stop_id", "stop_lat", "stop_lon", "stop_name"]),
+                stops_lf.select(["stop_id", "stop_lat", "stop_lon", "stop_name"]),
                 on="stop_id",
                 how="inner",
             )
@@ -1068,19 +1143,19 @@ class OSMRelationBuilder:
             .select(
                 [
                     "stop_id",
-                    pl.col("stop_lat").alias("lat"),
-                    pl.col("stop_lon").alias("lon"),
+                    pl.col("stop_lat").cast(pl.Float64).alias("lat"),
+                    pl.col("stop_lon").cast(pl.Float64).alias("lon"),
                     pl.col("stop_name").alias("name"),
                 ]
             )
-        )
+        ).collect()
 
         return stop_locations
 
     def _get_route_ways(
         self,
         shape_id: str | int,
-        shapes: pl.DataFrame,
+        shapes: pl.DataFrame | pl.LazyFrame,
         costing: str = "bus",
         max_retries: int = 3,
         retry_delay: float = 2.0,
@@ -1098,11 +1173,15 @@ class OSMRelationBuilder:
         Returns:
             List of unique OSM way IDs that make up the route
         """
+        if not shape_id:
+            return []
+
         logger.info(f"Getting OSM ways for route {shape_id}")
 
-        filtered_shapes = shapes.filter(pl.col("shape_id") == shape_id).sort(
+        shapes_lf = shapes if isinstance(shapes, pl.LazyFrame) else shapes.lazy()
+        filtered_shapes = shapes_lf.filter(pl.col("shape_id").cast(pl.Utf8) == str(shape_id)).sort(
             "shape_pt_sequence"
-        )
+        ).collect()
 
         route_ways = []
 
@@ -1113,16 +1192,10 @@ class OSMRelationBuilder:
         request_json = {
             "shape": filtered_shapes.select(
                 [
-                    pl.struct(
-                        [
-                            pl.col("shape_pt_lat").alias("lat"),
-                            pl.col("shape_pt_lon").alias("lon"),
-                        ]
-                    )
+                    pl.col("shape_pt_lat").cast(pl.Float64).alias("lat"),
+                    pl.col("shape_pt_lon").cast(pl.Float64).alias("lon"),
                 ]
-            )
-            .to_series()
-            .to_list(),
+            ).to_dicts(),
             "costing": costing,
             "costing_options": {
                 "maneuver_penalty": 10,
