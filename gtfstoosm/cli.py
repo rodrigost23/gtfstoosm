@@ -180,9 +180,9 @@ def main(args: list[str] | None = None) -> int:
             logger.error("Stop search radius must be a positive number")
             return 1
 
-        if parsed_args.stop_search_radius > 10:
-            logger.warning("Stop search radius is too large, reverting to 10 meters")
-            parsed_args.stop_search_radius = 10
+        if parsed_args.stop_search_radius > 100:
+            logger.warning("Stop search radius is too large, reverting to 100 meters")
+            parsed_args.stop_search_radius = 100
 
         # Validate output directory
         output_dir = os.path.dirname(parsed_args.output_file)

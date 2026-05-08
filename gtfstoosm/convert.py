@@ -199,33 +199,30 @@ class OSMRelationBuilder:
                 str(k): str(v) for k, v in route_master_tags.items() if v is not None
             }
 
+            # Create candidate master relation (GTFS Truth)
+            master = OSMRelation(
+                id=-1 * random.randint(1, 10**6),
+                tags=route_master_tags,
+            )
+
             # Reuse existing master ID and tags if found
             if existing["master"]:
-                master_id = existing["master"].id
+                master.id = existing["master"].id
+                master.version = existing["master"].version
+                master.changeset = existing["master"].changeset
+                master.timestamp = existing["master"].timestamp
+                master.user = existing["master"].user
+                master.uid = existing["master"].uid
                 
-                # Use Faithful Editor merging strategy
-                full_tags = self._merge_tags(existing["master"].tags, route_master_tags)
-                
-                master = OSMRelation(
-                    id=master_id,
-                    version=existing["master"].version,
-                    changeset=existing["master"].changeset,
-                    timestamp=existing["master"].timestamp,
-                    user=existing["master"].user,
-                    uid=existing["master"].uid,
-                    tags=full_tags,
-                    members=existing["master"].members.copy(), # Start with existing members
-                    force_conflict=(self.merge_strategy == "conflict")
-                )
                 # Store original state for functional comparison
                 master.original_tags = existing["master"].original_tags.copy()
                 master.original_members = existing["master"].original_members.copy()
-            else:
-                master_id = -1 * random.randint(1, 10**6)
-                master = OSMRelation(
-                    id=master_id,
-                    tags=route_master_tags,
-                )
+                
+                # Use Faithful Editor merging strategy for tags
+                master.tags = self._merge_tags(existing["master"].tags, master.tags)
+                
+                # Always force conflict to version="1" when matching existing relations
+                master.force_conflict = (self.merge_strategy == "conflict")
 
             # Try to match GTFS sub-routes to existing OSM sub-routes
             available_existing = list(existing["routes"])
@@ -298,8 +295,8 @@ class OSMRelationBuilder:
                             logger.info(
                                 f"Matching GTFS route '{route.tags.get('name')}' to existing OSM relation {match.id}"
                             )
-                            # Update existing relation with GTFS tags and members
-                            # but preserve what was already there
+                            # Update existing relation with GTFS identity metadata
+                            # but KEEP the GTFS-generated member list (GTFS Truth)
                             route.id = match.id
                             route.version = match.version
                             route.changeset = match.changeset
@@ -311,19 +308,10 @@ class OSMRelationBuilder:
                             route.original_tags = match.original_tags.copy()
                             route.original_members = match.original_members.copy()
                             
-                            # Use Faithful Editor merging strategy
+                            # Use Faithful Editor merging strategy for tags
                             route.tags = self._merge_tags(match.tags, route.tags)
                             
-                            # Preserve members and set conflict flag
-                            gtfs_members = route.members.copy()
-                            route.members = match.members.copy()
-                            
-                            # Append missing GTFS stops (nodes) to the existing member list
-                            existing_node_refs = {m.ref for m in route.members if m.type == "node"}
-                            for m in gtfs_members:
-                                if m.type == "node" and m.ref not in existing_node_refs:
-                                    route.add_member(osm_type="node", ref=m.ref, role="platform")
-                            
+                            # Always force conflict to version="1" when matching existing relations
                             route.force_conflict = (self.merge_strategy == "conflict")
                             
                             available_existing.remove(match)

@@ -972,3 +972,54 @@ class TestEdgeCases:
         # File should be overwritten (sizes should match)
         assert first_size == second_size
         assert output_file.exists()
+
+
+class TestOverpassQueryFormation:
+    """Tests for the formation of Overpass API queries."""
+
+    def test_find_existing_routes_query_format(self):
+        """Test that _find_existing_routes generates the correct query string."""
+        builder = OSMRelationBuilder()
+        bbox = (-23.0, -43.0, -22.0, -42.0)
+
+        import unittest.mock as mock
+        with mock.patch("requests.post") as mocked_post:
+            mocked_post.return_value.status_code = 200
+            mocked_post.return_value.json.return_value = {"elements": []}
+
+            builder._find_existing_routes("606", "Route 606", bbox, "GTFS_ID")
+
+            # Extract the query from the call
+            _, kwargs = mocked_post.call_args
+            query = kwargs["data"]
+
+            assert 'rel["type"="route"]["route"="bus"]["ref"="606"](-23.0,-43.0,-22.0,-42.0)' in query
+            assert 'rel["type"="route"]["route"="bus"]["gtfs:route_id"="GTFS_ID"](-23.0,-43.0,-22.0,-42.0)' in query
+            assert 'rel["type"="route_master"]["ref"="606"](-23.0,-43.0,-22.0,-42.0)' in query
+
+    def test_get_stop_objects_bbox_query(self):
+        """Test that _get_stop_objects generates a single BBox query."""
+        builder = OSMRelationBuilder()
+        stops = pl.DataFrame({
+            "stop_id": ["S1"],
+            "lat": [10.0],
+            "lon": [20.0],
+            "name": ["Stop 1"]
+        })
+
+        import unittest.mock as mock
+        with mock.patch("requests.post") as mocked_post:
+            mocked_post.return_value.status_code = 200
+            mocked_post.return_value.json.return_value = {"elements": []}
+
+            builder._get_stop_objects(stops, add_missing_stops=False)
+
+            # Should have called requests.post exactly once
+            assert mocked_post.call_count == 1
+
+            _, kwargs = mocked_post.call_args
+            query = kwargs["data"]
+
+            # Check for BBox node query
+            assert 'node["highway"="bus_stop"]' in query
+            assert 'node["public_transport"="platform"]' in query
