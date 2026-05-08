@@ -6,6 +6,7 @@ converting it to OSM relations that can be imported into OpenStreetMap.
 """
 
 import logging
+import math
 import random
 import time
 
@@ -114,7 +115,7 @@ class OSMRelationBuilder:
             osm_route_type = self._get_osm_route_type(unique_route.get("route_type", 3))
 
             # Look for existing relations in OSM
-            existing = self._find_existing_routes(route_ref, master_name, bbox)
+            existing = self._find_existing_routes(route_ref, master_name, bbox, gtfs_route_id)
 
             route_master_tags = {
                 "type": "route_master",
@@ -187,9 +188,11 @@ class OSMRelationBuilder:
             available_existing = list(existing["routes"])
             for route in self.relations:
                 if route.tags.get("ref") == route_ref:
+                    logger.debug(f"Attempting to match GTFS route '{route.tags.get('name')}' (shape_id: {route.tags.get('gtfs:shape_id')})")
                     # If we have existing sub-routes, try to match by name or gtfs:route_id or gtfs:shape_id
                     match = None
                     if available_existing:
+                        # 1. Match by gtfs:shape_id
                         match = next(
                             (
                                 r
@@ -199,8 +202,25 @@ class OSMRelationBuilder:
                             ),
                             None,
                         )
+                        if match:
+                            logger.debug(f"  Matched by gtfs:shape_id: {match.id}")
 
                         if not match:
+                            # 2. Match by gtfs:route_id
+                            match = next(
+                                (
+                                    r
+                                    for r in available_existing
+                                    if r.tags.get("gtfs:route_id")
+                                    == gtfs_route_id
+                                ),
+                                None,
+                            )
+                            if match:
+                                logger.debug(f"  Matched by gtfs:route_id: {match.id}")
+
+                        if not match:
+                            # 3. Match by name
                             match = next(
                                 (
                                     r
@@ -210,8 +230,11 @@ class OSMRelationBuilder:
                                 ),
                                 None,
                             )
+                            if match:
+                                logger.debug(f"  Matched by exact name: {match.id}")
                         
                         if not match:
+                            # 4. Match by shape_id prefix
                             match = next(
                                 (
                                     r
@@ -222,17 +245,11 @@ class OSMRelationBuilder:
                                 ),
                                 None,
                             )
-                        
+                            if match:
+                                logger.debug(f"  Matched by shape_id prefix: {match.id}")
+
                         if not match:
-                            match = next(
-                                (
-                                    r
-                                    for r in available_existing
-                                    if r.tags.get("gtfs:route_id")
-                                    == gtfs_route_id
-                                ),
-                                None,
-                            )
+                            logger.debug("  No match found among existing OSM relations")
 
                         if match:
                             logger.info(
@@ -599,33 +616,56 @@ class OSMRelationBuilder:
                         
         return tags
 
-    def _get_bbox(self, stops: pl.DataFrame) -> tuple[float, float, float, float]:
-        """Calculate the bounding box of all stops."""
+    def _get_bbox(self, stops: pl.DataFrame, buffer_meters: float = 50.0) -> tuple[float, float, float, float]:
+        """Calculate the bounding box of all stops with a safety buffer."""
+        if stops.is_empty():
+            return (0.0, 0.0, 0.0, 0.0)
+            
+        # Approximation: 1 degree ~= 111km
+        lat_buffer = buffer_meters / 111000.0
+        avg_lat = stops["stop_lat"].mean()
+        lon_buffer = buffer_meters / (111000.0 * abs(math.cos(math.radians(avg_lat))))
+
         return (
-            stops["stop_lat"].min(),
-            stops["stop_lon"].min(),
-            stops["stop_lat"].max(),
-            stops["stop_lon"].max(),
+            stops["stop_lat"].min() - lat_buffer,
+            stops["stop_lon"].min() - lon_buffer,
+            stops["stop_lat"].max() + lat_buffer,
+            stops["stop_lon"].max() + lon_buffer,
         )
 
     def _find_existing_routes(
-        self, ref: str, name: str, bbox: tuple[float, float, float, float]
+        self, ref: str, name: str, bbox: tuple[float, float, float, float], gtfs_route_id: str | None = None
     ) -> dict:
         """Query Overpass for existing route_master and its route members."""
         s, w, n, e = bbox
+        
+        # Build query searching by ref OR gtfs:route_id
+        # We also look for route_masters directly by ref/id
         query = f"""
         [out:json][timeout:30];
         (
           rel["type"="route"]["route"="bus"]["ref"="{ref}"]({s},{w},{n},{e});
-        )->.routes;
+          rel["type"="route_master"]["ref"="{ref}"]({s},{w},{n},{e});
+        """
+        
+        if gtfs_route_id:
+            query += f"""
+          rel["type"="route"]["route"="bus"]["gtfs:route_id"="{gtfs_route_id}"]({s},{w},{n},{e});
+          rel["type"="route_master"]["gtfs:route_id"="{gtfs_route_id}"]({s},{w},{n},{e});
+            """
+            
+        query += f"""
+        )->.all_matches;
 
         (
-          rel(br.routes)["type"="route_master"];
-        )->.master;
-
-        .master out meta;
-        .routes out meta;
+          .all_matches;
+          rel(br.all_matches)["type"="route_master"];
+          rel(r.all_matches)["type"="route"];
+        );
+        out meta;
         """
+
+        logger.debug(f"Overpass query for existing routes (ref={ref}, id={gtfs_route_id}):\n{query}")
 
         try:
             response = requests.post(
@@ -633,6 +673,13 @@ class OSMRelationBuilder:
             )
             if response.status_code == 200:
                 elements = response.json().get("elements", [])
+                logger.debug(f"Overpass returned {len(elements)} elements")
+
+                for el in elements:
+                    if el.get("type") == "relation":
+                        tags = el.get("tags", {})
+                        gtfs_tags = {k: v for k, v in tags.items() if k.startswith("gtfs:")}
+                        logger.debug(f"  Candidate Relation {el['id']}: ref={tags.get('ref')}, name={tags.get('name')}, gtfs_tags={gtfs_tags}")
 
                 # Helper to create OSMRelation from Overpass element
                 def element_to_relation(el):
@@ -664,6 +711,7 @@ class OSMRelationBuilder:
                         e
                         for e in elements
                         if e.get("tags", {}).get("type") == "route_master"
+                        and (e.get("tags", {}).get("gtfs:route_id") == gtfs_route_id or e.get("tags", {}).get("ref") == ref)
                     ),
                     None,
                 )
@@ -698,27 +746,21 @@ class OSMRelationBuilder:
 
         osm_elements: list[OSMElement] = []
 
-        # Build a single query with all coordinates
-        around_clauses = [
-            f"(around:{max_distance},{stop_row['lat']},{stop_row['lon']})"
-            for stop_row in stops.iter_rows(named=True)
-        ]
-
-        query_body = "\n".join(
-            f"""
-        node["highway"="bus_stop"]{around};
-        node["public_transport"="platform"]{around};
-        """
-            for around in around_clauses
-        )
+        # Calculate BBox from the stops with a buffer
+        # We rename columns temporarily to match _get_bbox expectations
+        bbox_stops = stops.rename({"lat": "stop_lat", "lon": "stop_lon"})
+        s, w, n, e = self._get_bbox(bbox_stops, buffer_meters=max_distance * 2)
 
         query = f"""
         [out:json][timeout:60];
         (
-        {query_body}
+          node["highway"="bus_stop"]({s},{w},{n},{e});
+          node["public_transport"="platform"]({s},{w},{n},{e});
         );
         out meta;
         """
+
+        logger.debug(f"Overpass query for stops in BBox:\n{query}")
 
         max_retries = 3
         retry_count = 0
@@ -726,7 +768,7 @@ class OSMRelationBuilder:
         while retry_count <= max_retries:
             try:
                 logger.info(
-                    f"Querying Overpass API for {stops.height} stop locations (attempt {retry_count + 1})"
+                    f"Querying Overpass API for stops in route BBox (attempt {retry_count + 1})"
                 )
                 response = requests.post(
                     self.OVERPASS_URL,
@@ -767,28 +809,42 @@ class OSMRelationBuilder:
                             osm_node.original_tags = node_tags.copy()
                             all_osm_nodes.append(osm_node)
 
+                    logger.debug(f"Overpass returned {len(all_osm_nodes)} candidate nodes in BBox")
+
                     # Now match each input stop to its nearest OSM node
                     for stop_row in stops.iter_rows(named=True):
                         stop_lat = stop_row["lat"]
                         stop_lon = stop_row["lon"]
+                        gtfs_stop_id = str(stop_row["stop_id"])
 
                         # Find the closest OSM node to this stop
                         closest_node = None
                         min_distance = float("inf")
 
-                        for osm_node in all_osm_nodes:
-                            # Calculate distance using Haversine formula (approximate)
-                            distance = self._calculate_distance(
-                                stop_lat, stop_lon, osm_node.lat, osm_node.lon
-                            )
+                        # Priority match: check if any node already has the gtfs:stop_id
+                        id_match = next((n for n in all_osm_nodes if n.tags.get("gtfs:stop_id") == gtfs_stop_id), None)
+                        if id_match:
+                            dist = self._calculate_distance(stop_lat, stop_lon, id_match.lat, id_match.lon)
+                            if dist <= max_distance * 2: # Loose distance check for ID matches
+                                closest_node = id_match
+                                logger.debug(f"  Stop {gtfs_stop_id} matched by gtfs:stop_id to Node {id_match.id}")
 
-                            if (
-                                distance < min_distance and distance <= max_distance
-                            ):  # Within 5 meter radius
-                                min_distance = distance
-                                closest_node = osm_node
+                        if not closest_node:
+                            for osm_node in all_osm_nodes:
+                                distance = self._calculate_distance(
+                                    stop_lat, stop_lon, osm_node.lat, osm_node.lon
+                                )
 
-                        # Add the closest node (or None if no match within 5m)
+                                if (
+                                    distance < min_distance and distance <= max_distance
+                                ):
+                                    min_distance = distance
+                                    closest_node = osm_node
+                            
+                            if closest_node:
+                                logger.debug(f"  Stop {gtfs_stop_id} matched by proximity ({min_distance:.1f}m) to Node {closest_node.id}")
+
+                        # Add the closest node (or None if no match within radius)
                         if closest_node:
                             # Enrich with missing tags
                             modified = False
@@ -1185,12 +1241,6 @@ def convert_gtfs_to_osm(
         IOError: If writing the OSM file fails
     """
     try:
-        # Configure logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        )
-
         # Load GTFS data
         loader = GTFSFeed(feed_dir=gtfs_path)
         loader.load()
