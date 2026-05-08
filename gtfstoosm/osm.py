@@ -16,6 +16,7 @@ class OSMElement(BaseModel):
     uid: int | None = None
     tags: dict[str, str] = Field(default_factory=dict)
     original_tags: dict[str, str] = Field(default_factory=dict)
+    force_conflict: bool = False
 
     def is_functionally_changed(self) -> bool:
         """Check if the element has functional changes from its original state."""
@@ -45,7 +46,8 @@ class OSMElement(BaseModel):
 
     def get_base_attributes(self) -> str:
         """Get standard OSM XML attributes."""
-        attrs = [f'id="{self.id}"', f'version="{self.version}"']
+        version = "1" if self.force_conflict else self.version
+        attrs = [f'id="{self.id}"', f'version="{version}"']
         if self.changeset:
             attrs.append(f'changeset="{self.changeset}"')
         if self.timestamp:

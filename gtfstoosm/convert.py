@@ -45,6 +45,7 @@ class OSMRelationBuilder:
         route_direction: bool = False,
         route_ref_pattern: str | None = None,
         relation_tags: dict[str, str] | None = None,
+        merge_strategy: str = "conflict",
     ):
         """
         Initialize the OSM relation builder.
@@ -62,6 +63,7 @@ class OSMRelationBuilder:
         self.route_direction: bool = route_direction
         self.route_ref_pattern: str | None = route_ref_pattern
         self.relation_tags: dict[str, str] | None = relation_tags
+        self.merge_strategy: str = merge_strategy
 
     def __str__(self) -> str:
         # Exclude None values and internal collections
@@ -93,6 +95,52 @@ class OSMRelationBuilder:
         logger.info(
             f"Built {len(self.relations)} route relations and {len(self.nodes) + len(self.new_stops)} nodes"
         )
+
+    def _merge_tags(self, existing_tags: dict[str, str], gtfs_tags: dict[str, str]) -> dict[str, str]:
+        """
+        Merge GTFS tags into existing OSM tags using a 'Faithful Editor' strategy.
+        """
+        merged = existing_tags.copy()
+
+        # Tags that we ALWAYS overwrite (linkage/metadata)
+        always_overwrite = {
+            "gtfs:route_id",
+            "gtfs:shape_id",
+            "gtfs:trip_id:sample",
+            "gtfs:feed",
+        }
+
+        # Tags that we only ADD if they are missing
+        add_if_missing = {
+            "operator",
+            "network",
+            "colour",
+            "public_transport:version",
+        }
+
+        # Tags that we NEVER overwrite (manual curation)
+        never_overwrite = {
+            "name",
+            "description",
+            "from",
+            "to",
+            "opening_hours",
+            "interval",
+            "interval:conditional",
+        }
+
+        for k, v in gtfs_tags.items():
+            if k in always_overwrite:
+                merged[k] = v
+            elif k in add_if_missing:
+                if k not in merged:
+                    merged[k] = v
+            elif k not in never_overwrite:
+                # Default behavior for other tags: update if missing
+                if k not in merged:
+                    merged[k] = v
+
+        return merged
 
     def build_route_masters(self, gtfs_data: dict[str, pl.DataFrame]) -> None:
         """
@@ -154,15 +202,9 @@ class OSMRelationBuilder:
             # Reuse existing master ID and tags if found
             if existing["master"]:
                 master_id = existing["master"].id
-                # Preserve existing tags, only update/add from GTFS
-                full_tags = existing["master"].tags.copy()
-                # Preserve existing name tag if present (don't overwrite with GTFS name)
-                existing_master_name = existing["master"].tags.get("name")
-                # Create a copy of GTFS tags to avoid modifying the original
-                update_tags = route_master_tags.copy()
-                if existing_master_name and "name" in update_tags:
-                    del update_tags["name"]
-                full_tags.update(update_tags)
+                
+                # Use Faithful Editor merging strategy
+                full_tags = self._merge_tags(existing["master"].tags, route_master_tags)
                 
                 master = OSMRelation(
                     id=master_id,
@@ -172,7 +214,8 @@ class OSMRelationBuilder:
                     user=existing["master"].user,
                     uid=existing["master"].uid,
                     tags=full_tags,
-                    members=existing["master"].members.copy() # Start with existing members
+                    members=existing["master"].members.copy(), # Start with existing members
+                    force_conflict=(self.merge_strategy == "conflict")
                 )
                 # Store original state for functional comparison
                 master.original_tags = existing["master"].original_tags.copy()
@@ -268,15 +311,20 @@ class OSMRelationBuilder:
                             route.original_tags = match.original_tags.copy()
                             route.original_members = match.original_members.copy()
                             
-                            new_tags = match.tags.copy()
-                            # Preserve existing name tag if present (don't overwrite with GTFS name)
-                            existing_name = match.tags.get("name")
-                            if existing_name and "name" in route.tags:
-                                # Use a copy to avoid modifying the original during iteration? 
-                                # Actually route.tags is unique to this route
-                                del route.tags["name"]
-                            new_tags.update(route.tags)
-                            route.tags = new_tags
+                            # Use Faithful Editor merging strategy
+                            route.tags = self._merge_tags(match.tags, route.tags)
+                            
+                            # Preserve members and set conflict flag
+                            gtfs_members = route.members.copy()
+                            route.members = match.members.copy()
+                            
+                            # Append missing GTFS stops (nodes) to the existing member list
+                            existing_node_refs = {m.ref for m in route.members if m.type == "node"}
+                            for m in gtfs_members:
+                                if m.type == "node" and m.ref not in existing_node_refs:
+                                    route.add_member(osm_type="node", ref=m.ref, role="platform")
+                            
+                            route.force_conflict = (self.merge_strategy == "conflict")
                             
                             available_existing.remove(match)
 
@@ -667,64 +715,83 @@ class OSMRelationBuilder:
 
         logger.debug(f"Overpass query for existing routes (ref={ref}, id={gtfs_route_id}):\n{query}")
 
-        try:
-            response = requests.post(
-                self.OVERPASS_URL, data=query, headers={"User-Agent": self.USER_AGENT}
-            )
-            if response.status_code == 200:
-                elements = response.json().get("elements", [])
-                logger.debug(f"Overpass returned {len(elements)} elements")
+        max_retries = 3
+        retry_count = 0
 
-                for el in elements:
-                    if el.get("type") == "relation":
-                        tags = el.get("tags", {})
-                        gtfs_tags = {k: v for k, v in tags.items() if k.startswith("gtfs:")}
-                        logger.debug(f"  Candidate Relation {el['id']}: ref={tags.get('ref')}, name={tags.get('name')}, gtfs_tags={gtfs_tags}")
-
-                # Helper to create OSMRelation from Overpass element
-                def element_to_relation(el):
-                    tags = {str(k): str(v) for k, v in el.get("tags", {}).items()}
-                    rel = OSMRelation(
-                        id=el["id"],
-                        version=el.get("version", 1),
-                        changeset=el.get("changeset"),
-                        timestamp=el.get("timestamp"),
-                        user=el.get("user"),
-                        uid=el.get("uid"),
-                        tags=tags
-                    )
-                    # Capture original state from Overpass for functional comparison
-                    rel.original_tags = tags.copy()
-                    # We don't necessarily need the members here for matching,
-                    # but we store them if they exist in the response
-                    for member in el.get("members", []):
-                        rel.add_member(member["type"], member["ref"], member.get("role", ""))
-                    # Capture original members after they've been added
-                    rel.original_members = [
-                        RelationMember(type=m.type, ref=m.ref, role=m.role)
-                        for m in rel.members
-                    ]
-                    return rel
-
-                master_el = next(
-                    (
-                        e
-                        for e in elements
-                        if e.get("tags", {}).get("type") == "route_master"
-                        and (e.get("tags", {}).get("gtfs:route_id") == gtfs_route_id or e.get("tags", {}).get("ref") == ref)
-                    ),
-                    None,
+        while retry_count <= max_retries:
+            try:
+                response = requests.post(
+                    self.OVERPASS_URL, data=query, headers={"User-Agent": self.USER_AGENT}
                 )
-                master = element_to_relation(master_el) if master_el else None
+                if response.status_code == 200:
+                    elements = response.json().get("elements", [])
+                    logger.debug(f"Overpass returned {len(elements)} elements")
 
-                routes = [
-                    element_to_relation(e)
-                    for e in elements
-                    if e.get("tags", {}).get("type") == "route"
-                ]
-                return {"master": master, "routes": routes}
-        except Exception as e:
-            logger.warning(f"Error searching for existing routes: {e}")
+                    for el in elements:
+                        if el.get("type") == "relation":
+                            tags = el.get("tags", {})
+                            gtfs_tags = {k: v for k, v in tags.items() if k.startswith("gtfs:")}
+                            logger.debug(f"  Candidate Relation {el['id']}: ref={tags.get('ref')}, name={tags.get('name')}, gtfs_tags={gtfs_tags}")
+
+                    # Helper to create OSMRelation from Overpass element
+                    def element_to_relation(el):
+                        tags = {str(k): str(v) for k, v in el.get("tags", {}).items()}
+                        rel = OSMRelation(
+                            id=el["id"],
+                            version=el.get("version", 1),
+                            changeset=el.get("changeset"),
+                            timestamp=el.get("timestamp"),
+                            user=el.get("user"),
+                            uid=el.get("uid"),
+                            tags=tags
+                        )
+                        # Capture original state from Overpass for functional comparison
+                        rel.original_tags = tags.copy()
+                        # We don't necessarily need the members here for matching,
+                        # but we store them if they exist in the response
+                        for member in el.get("members", []):
+                            rel.add_member(member["type"], member["ref"], member.get("role", ""))
+                        # Capture original members after they've been added
+                        rel.original_members = [
+                            RelationMember(type=m.type, ref=m.ref, role=m.role)
+                            for m in rel.members
+                        ]
+                        return rel
+
+                    master_el = next(
+                        (
+                            e
+                            for e in elements
+                            if e.get("tags", {}).get("type") == "route_master"
+                            and (e.get("tags", {}).get("gtfs:route_id") == gtfs_route_id or e.get("tags", {}).get("ref") == ref)
+                        ),
+                        None,
+                    )
+                    master = element_to_relation(master_el) if master_el else None
+
+                    routes = [
+                        element_to_relation(e)
+                        for e in elements
+                        if e.get("tags", {}).get("type") == "route"
+                    ]
+                    return {"master": master, "routes": routes}
+                
+                elif response.status_code in [429, 504]:
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        sleep_time = 5 * retry_count
+                        logger.warning(f"Overpass API error {response.status_code}. Retrying in {sleep_time}s... ({retry_count}/{max_retries})")
+                        time.sleep(sleep_time)
+                    else:
+                        logger.error(f"Overpass API error {response.status_code}. Max retries exceeded.")
+                        break
+                else:
+                    logger.warning(f"Overpass API error {response.status_code}")
+                    break
+
+            except Exception as e:
+                logger.warning(f"Error searching for existing routes: {e}")
+                break
 
         return {"master": None, "routes": []}
 
@@ -1256,6 +1323,7 @@ def convert_gtfs_to_osm(
             route_direction=options.get("route_direction", False),
             route_ref_pattern=options.get("route_ref_pattern"),
             relation_tags=options.get("relation_tags"),
+            merge_strategy=options.get("merge_strategy", "conflict"),
         )
 
         logger.debug(f"OSMRelationBuilder options: {builder}")

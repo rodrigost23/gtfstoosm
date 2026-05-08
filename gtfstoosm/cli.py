@@ -127,6 +127,14 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--merge-strategy",
+        dest="merge_strategy",
+        choices=["conflict", "overwrite"],
+        default="conflict",
+        help="Merge strategy for existing relations (default: conflict)",
+    )
+
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
@@ -193,6 +201,7 @@ def main(args: list[str] | None = None) -> int:
             "relation_tags": parse_tag_string(parsed_args.relation_tags)
             if parsed_args.relation_tags
             else None,
+            "merge_strategy": parsed_args.merge_strategy,
             # "route_types": parsed_args.route_types,
             # "agency_id": parsed_args.agency_id,
         }
