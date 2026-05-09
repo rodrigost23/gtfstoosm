@@ -852,6 +852,37 @@ class OSMRelationBuilder:
 
         return {"master": None, "routes": []}
 
+    def _apply_faithful_stop_tags(self, node: OSMNode, stop_row: dict) -> bool:
+        """
+        Apply GTFS tags to an OSM node using a selective merging strategy.
+        Returns True if the node was modified.
+        """
+        modified = False
+
+        forced_tags = {
+            "bus": "yes",
+            "gtfs:stop_id": str(stop_row["stop_id"])
+        }
+        for k, v in forced_tags.items():
+            if node.tags.get(k) != v:
+                node.tags[k] = v
+                modified = True
+
+        if node.tags.get("public_transport") != "platform":
+            node.tags["public_transport"] = "platform"
+            modified = True
+
+        has_infrastructure_tag = any(k in ["highway", "railway"] for k in node.tags)
+        if not has_infrastructure_tag:
+            node.tags["highway"] = "bus_stop"
+            modified = True
+
+        if "name" not in node.tags:
+            node.tags["name"] = str(stop_row["name"])
+            modified = True
+
+        return modified
+
     def _get_stop_objects(
         self, stops: pl.DataFrame, add_missing_stops: bool, max_distance: float = 5
     ) -> list[OSMElement]:
@@ -973,31 +1004,8 @@ class OSMRelationBuilder:
 
                         # Add the closest node (or None if no match within radius)
                         if closest_node:
-                            # Enrich with missing tags
-                            modified = False
-                            
-                            # Enforce required tags
-                            required_tags = {
-                                "bus": "yes",
-                                "highway": "bus_stop",
-                                "public_transport": "platform",
-                                "gtfs:stop_id": str(stop_row["stop_id"])
-                            }
-                            
-                            # Also add name if missing
-                            if "name" not in closest_node.tags:
-                                required_tags["name"] = str(stop_row["name"])
-
-                            for k, v in required_tags.items():
-                                if closest_node.tags.get(k) != v:
-                                    closest_node.tags[k] = v
-                                    modified = True
-
-                            if modified:
-                                # Track for <modify> section in .osc
-                                if not any(
-                                    n.id == closest_node.id for n in self.modified_nodes
-                                ):
+                            if self._apply_faithful_stop_tags(closest_node, stop_row):
+                                if not any(n.id == closest_node.id for n in self.modified_nodes):
                                     self.modified_nodes.append(closest_node)
 
                             osm_elements.append(closest_node)
@@ -1008,7 +1016,6 @@ class OSMRelationBuilder:
                                 f"No OSM stop found within {max_distance}m of GTFS stop at {stop_lat}, {stop_lon}"
                             )
                             if add_missing_stops:
-                                # Add the stop to the output
                                 new_stop = OSMNode(
                                     id=-1 * string_to_unique_int(str(stop_row["stop_id"])),
                                     lat=stop_lat,
@@ -1017,6 +1024,7 @@ class OSMRelationBuilder:
                                         "name": stop_row["name"],
                                         "public_transport": "platform",
                                         "highway": "bus_stop",
+                                        "bus": "yes",
                                         "gtfs:stop_id": str(stop_row["stop_id"])
                                     },
                                 )
